@@ -20,7 +20,7 @@ const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// --- API ROUTES ALIGNED TO YOUR SCHEMA ---
+// --- API ROUTES ---
 
 // 1. Health Check
 app.get('/api/health-check', async (req, res) => {
@@ -52,14 +52,9 @@ app.post('/api/register', async (req, res) => {
     if (player) {
       return res.json({ isNew: false, user: player });
     } else {
-      // Matches your schema columns exactly
       const { data: newPlayer, error: insertError } = await supabase
         .from('players')
-        .insert([{ 
-          username, 
-          phone_number, 
-          balance: 10 // Aligned to your single balance column
-        }])
+        .insert([{ username, phone_number, balance: 10 }])
         .select()
         .single();
 
@@ -77,7 +72,7 @@ app.get('/api/player/:id', async (req, res) => {
     const { data: player, error } = await supabase
       .from('players')
       .select('*')
-      .eq('player_id', req.params.id) // Using your schema's player_id
+      .eq('player_id', req.params.id)
       .single();
 
     if (error) throw error;
@@ -87,14 +82,15 @@ app.get('/api/player/:id', async (req, res) => {
   }
 });
 
-// 4. Update Balance
+// 4. Update Balance (Fixed property reading to accommodate 'id' or 'player_id')
 app.post('/api/player/update-balance', async (req, res) => {
-  const { player_id, balance } = req.body;
+  const { id, player_id, balance } = req.body;
+  const targetId = player_id || id;
   try {
     const { data, error } = await supabase
       .from('players')
       .update({ balance })
-      .eq('player_id', player_id)
+      .eq('player_id', targetId)
       .select()
       .single();
 
@@ -105,17 +101,16 @@ app.post('/api/player/update-balance', async (req, res) => {
   }
 });
 
-// 5. Join Game Session (Log Cards Purchase)
+// 5. Join Game Session
 app.post('/api/games/create', async (req, res) => {
   const { player_id, game_id, cards_bought } = req.body;
   try {
-    // Aligned to your game_participants table
     const { data, error } = await supabase
       .from('game_participants')
       .insert([{ 
         player_id, 
         game_id, 
-        purchased_cards: cards_bought, // Maps to your jsonb field
+        purchased_cards: cards_bought, 
         is_winner: false 
       }]);
 
@@ -143,40 +138,86 @@ app.post('/api/games/update-status', async (req, res) => {
   }
 });
 
-// --- MULTIPLAYER ROOM LOOP ---
+
+// --- SERVER AUTHORITATIVE BINGO CORE LOOP ---
 let globalGameState = "waiting"; 
 let timeRemaining = 40;
-let connectedPlayersCount = 0;
+let currentActiveGameRoundId = Math.floor(100000 + Math.random() * 900000).toString();
+let ballPool = [];
+let drawnBallsHistory = [];
+let gameBallInterval = null;
 
+// Populate initial available balls array (1 to 75)
+function resetBallPool() {
+  ballPool = [];
+  drawnBallsHistory = [];
+  for (let i = 1; i <= 75; i++) ballPool.push(i);
+}
+resetBallPool();
+
+// Central 1-second room timer ticker
 setInterval(() => {
-  timeRemaining--;
-  if (timeRemaining <= 0) {
-    if (globalGameState === "waiting") {
+  if (globalGameState === "waiting") {
+    timeRemaining--;
+    if (timeRemaining <= 0) {
+      // Transition to active gaming match
       globalGameState = "playing";
-      timeRemaining = 120;
-      io.emit('game_started');
-    } else {
-      globalGameState = "waiting";
-      timeRemaining = 40;
-      io.emit('game_reset');
+      timeRemaining = 120; // fallback max duration limits
+      resetBallPool();
+      startBallDrawingSequence();
     }
   }
-  io.emit('state_tick', {
-    gameState: globalGameState,
-    timeRemaining: timeRemaining,
-    activePlayers: connectedPlayersCount
+  
+  // Emitting the exact event schema and channel expected by client UI
+  io.emit('room_tick', {
+    gameId: currentActiveGameRoundId,
+    state: globalGameState,
+    timeRemaining: timeRemaining
   });
 }, 1000);
 
+function startBallDrawingSequence() {
+  if (gameBallInterval) clearInterval(gameBallInterval);
+  
+  gameBallInterval = setInterval(() => {
+    if (globalGameState !== "playing" || ballPool.length === 0) {
+      clearInterval(gameBallInterval);
+      return;
+    }
+    
+    // Draw random number from pool
+    const randomIndex = Math.floor(Math.random() * ballPool.length);
+    const drawnNumber = ballPool.splice(randomIndex, 1)[0];
+    drawnBallsHistory.push(drawnNumber);
+    
+    // Broadcast newly called number to room
+    io.emit('ball_drawn', {
+      number: drawnNumber,
+      pool: drawnBallsHistory
+    });
+  }, 3000); // Calls a new number every 3 seconds
+}
+
+function handleMatchOver(winnerName, cardNum) {
+  if (gameBallInterval) clearInterval(gameBallInterval);
+  globalGameState = "waiting";
+  timeRemaining = 15; // Give players time to view modal before starting next registration cycle
+  io.emit('opponent_victory', { winnerName, cardNum });
+  currentActiveGameRoundId = Math.floor(100000 + Math.random() * 900000).toString();
+}
+
 io.on('connection', (socket) => {
-  connectedPlayersCount++;
-  socket.emit('state_tick', {
-    gameState: globalGameState,
-    timeRemaining: timeRemaining,
-    activePlayers: connectedPlayersCount
+  socket.emit('room_tick', {
+    gameId: currentActiveGameRoundId,
+    state: globalGameState,
+    timeRemaining: timeRemaining
   });
-  socket.on('disconnect', () => {
-    connectedPlayersCount = Math.max(0, connectedPlayersCount - 1);
+
+  // Handle incoming manual/auto validation check requests
+  socket.on('claim_bingo', (data) => {
+    if (globalGameState === "playing") {
+      handleMatchOver(data.username || "Anonymous Player", data.cardNum);
+    }
   });
 });
 

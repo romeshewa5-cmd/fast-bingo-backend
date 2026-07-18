@@ -1,85 +1,45 @@
+require('dotenv').config();
 const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
 const cors = require('cors');
+const { createServer } = require('http');
+const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+
 app.use(cors());
 app.use(express.json());
 
-const server = http.createServer(app);
-const io = new Server(server, {
+const supabaseUrl = process.env.SUPABASE_URL || "https://rsmobdnuyxqyynxtjkyi.supabase.co";
+const supabaseKey = process.env.SUPABASE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+// --- API ROUTES ---
 
-console.log("🌲 Supabase client initialized successfully.");
-
-// --- STATE MANAGEMENT ---
-let gameLoopState = "waiting"; 
-let countdownTimer = 40; // Unified 40s countdown match block
-let pulledNumbersPool = [];
-let availableBalls = [];
-let gameIntervalLoop = null;
-let currentActiveGameId = "GM" + Math.floor(100000 + Math.random() * 900000);
-
-function resetAvailableBalls() {
-  availableBalls = [];
-  for (let i = 1; i <= 75; i++) availableBalls.push(i);
-  pulledNumbersPool = [];
-}
-resetAvailableBalls();
-
-// Unified Lobby & Card Selection Countdown Ticker Loop
-setInterval(async () => {
-  if (gameLoopState === "waiting") {
-    countdownTimer--;
-    
-    io.emit('room_tick', { state: "waiting", timeRemaining: countdownTimer, gameId: currentActiveGameId });
-    
-    if (countdownTimer <= 0) {
-      gameLoopState = "playing";
-      countdownTimer = 40;
-      io.emit('room_tick', { state: "playing", timeRemaining: 0, gameId: currentActiveGameId });
-      startBallDroppingEngine();
-    }
-  } else if (gameLoopState === "playing") {
-    // Also emit current status to inside-game connections so timers display cleanly
-    io.emit('room_tick', { state: "playing", timeRemaining: 0, gameId: currentActiveGameId });
+// 1. Health Check
+app.get('/api/health-check', async (req, res) => {
+  try {
+    const { error } = await supabase.from('players').select('count', { count: 'exact', head: true });
+    if (error) throw error;
+    res.json({ status: "online", database: "connected" });
+  } catch (err) {
+    res.status(500).json({ status: "online", database: "disconnected", error: err.message });
   }
-}, 1000);
+});
 
-function startBallDroppingEngine() {
-  if (gameIntervalLoop) clearInterval(gameIntervalLoop);
-  resetAvailableBalls();
-  
-  gameIntervalLoop = setInterval(async () => {
-    if (gameLoopState !== "playing" || availableBalls.length === 0) {
-      clearInterval(gameIntervalLoop);
-      return;
-    }
-    const randomIndex = Math.floor(Math.random() * availableBalls.length);
-    const ballNumber = availableBalls.splice(randomIndex, 1)[0];
-    pulledNumbersPool.push(ballNumber);
-    
-    io.emit('ball_drawn', { number: ballNumber, pool: pulledNumbersPool });
-  }, 3500); 
-}
-
-function handleGameTerminatingVictory() {
-  if (gameIntervalLoop) clearInterval(gameIntervalLoop);
-  gameLoopState = "waiting";
-  countdownTimer = 40; // Next game countdown is always 40 seconds across rooms
-  currentActiveGameId = "GM" + Math.floor(100000 + Math.random() * 900000);
-}
-
-// --- SECURE AUTH & REAL MANAGEMENT ENDPOINTS ---
+// 2. Player Registration / Authentication
 app.post('/api/register', async (req, res) => {
   const { username, phone_number } = req.body;
+  if (!username || !phone_number) {
+    return res.status(400).json({ error: "Username and Phone Number are required." });
+  }
+
   try {
     let { data: player, error } = await supabase
       .from('players')
@@ -87,109 +47,214 @@ app.post('/api/register', async (req, res) => {
       .eq('phone_number', phone_number)
       .single();
 
-    if (!player) {
-      const { data: newPlayer, error: insError } = await supabase
+    if (error && error.code !== 'PGRST116') throw error;
+
+    if (player) {
+      return res.json({ isNew: false, user: player });
+    } else {
+      const { data: newPlayer, error: insertError } = await supabase
         .from('players')
-        .insert([{ username, phone_number, balance: 100 }])
+        .insert([{ username, phone_number, balance: 10 }])
         .select()
         .single();
-        
-      if (insError) throw insError;
-      player = newPlayer;
+
+      if (insertError) throw insertError;
+      return res.json({ isNew: true, user: newPlayer });
     }
-    res.json({ user: player });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// 3. Sync Player Profile/Balances
 app.get('/api/player/:id', async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data: player, error } = await supabase
       .from('players')
       .select('*')
       .eq('player_id', req.params.id)
       .single();
-    res.json(data);
+
+    if (error) throw error;
+    res.json(player);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// 4. Update Balance (Fixed property reading to accommodate 'id' or 'player_id')
 app.post('/api/player/update-balance', async (req, res) => {
-  const { id, balance } = req.body;
-  try {
-    await supabase.from('players').update({ balance }).eq('player_id', id);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Dynamic Feature Integrations
-app.get('/api/leaderboard', async (req, res) => {
+  const { id, player_id, balance } = req.body;
+  const targetId = player_id || id;
   try {
     const { data, error } = await supabase
       .from('players')
-      .select('username, balance')
-      .order('balance', { ascending: false })
-      .limit(10);
+      .update({ balance })
+      .eq('player_id', targetId)
+      .select()
+      .single();
+
     if (error) throw error;
     res.json(data);
   } catch (err) {
-    res.status(500).json([]);
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/api/history/:playerId', async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('games')
-      .select('*')
-      .eq('player_id', req.params.playerId)
-      .order('created_at', { ascending: false })
-      .limit(10);
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    res.status(500).json([]);
-  }
-});
-
+// 5. Join Game Session
 app.post('/api/games/create', async (req, res) => {
   const { player_id, game_id, cards_bought } = req.body;
   try {
-    await supabase.from('games').insert([{ player_id, game_id, cards_bought, status: 'playing', is_winner: false }]);
+    const { data, error } = await supabase
+      .from('game_participants')
+      .insert([{ 
+        player_id, 
+        game_id, 
+        purchased_cards: cards_bought, 
+        is_winner: false 
+      }]);
+
+    if (error) throw error;
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// 6. Update Winner Status
 app.post('/api/games/update-status', async (req, res) => {
-  const { game_id, player_id, status, is_winner } = req.body;
+  const { game_id, player_id, is_winner } = req.body;
   try {
-    await supabase.from('games').update({ status, is_winner }).eq('game_id', game_id).eq('player_id', player_id);
+    const { data, error } = await supabase
+      .from('game_participants')
+      .update({ is_winner })
+      .eq('game_id', game_id)
+      .eq('player_id', player_id);
+
+    if (error) throw error;
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// --- SOCKET HANDLERS ---
-io.on('connection', (socket) => {
-  socket.on('claim_bingo', (data) => {
-    if (gameLoopState === "playing") {
-      handleGameTerminatingVictory();
-      io.emit('opponent_victory', {
-        winnerName: data.username,
-        cardNum: data.cardNum
-      });
+// 7. GET Game History for a specific player (Hardened Internal Fix)
+app.get('/api/history/:player_id', async (req, res) => {
+  try {
+    const { player_id } = req.params;
+
+    // Validate parameters cleanly against empty states or literal corruption flags
+    if (!player_id || player_id === 'undefined' || player_id === 'null' || player_id === '[object Object]') {
+      return res.status(200).json([]);
     }
+
+    const { data, error } = await supabase
+      .from('game_participants') 
+      .select('game_id, purchased_cards, is_winner')
+      .eq('player_id', player_id);
+
+    if (error) {
+      console.error(`Supabase database query error for player ${player_id}:`, error.message);
+      return res.status(200).json([]); 
+    }
+
+    return res.status(200).json(data || []);
+
+  } catch (catchErr) {
+    console.error("Critical failure inside GET /api/history route handler:", catchErr);
+    return res.status(200).json([]); 
+  }
+});
+
+// --- SERVER AUTHORITATIVE BINGO CORE LOOP ---
+let globalGameState = "waiting"; 
+let timeRemaining = 40;
+let currentActiveGameRoundId = Math.floor(100000 + Math.random() * 900000).toString();
+let ballPool = [];
+let drawnBallsHistory = [];
+let gameBallInterval = null;
+
+// Populate initial available balls array (1 to 75)
+function resetBallPool() {
+  ballPool = [];
+  drawnBallsHistory = [];
+  for (let i = 1; i <= 75; i++) ballPool.push(i);
+}
+resetBallPool();
+
+// Central 1-second room timer ticker
+setInterval(() => {
+  if (globalGameState === "waiting") {
+    timeRemaining--;
+    if (timeRemaining <= 0) {
+      // Transition to active gaming match
+      globalGameState = "playing";
+      timeRemaining = 120; // fallback max duration limits
+      resetBallPool();
+      startBallDrawingSequence();
+    }
+  }
+  
+  // Emitting the exact event schema and channel expected by client UI
+  io.emit('room_tick', {
+    gameId: currentActiveGameRoundId,
+    state: globalGameState,
+    timeRemaining: timeRemaining
+  });
+}, 1000);
+
+function startBallDrawingSequence() {
+  if (gameBallInterval) clearInterval(gameBallInterval);
+  
+  gameBallInterval = setInterval(() => {
+    if (globalGameState !== "playing" || ballPool.length === 0) {
+      clearInterval(gameBallInterval);
+      return;
+    }
+    
+    // Draw random number from pool
+    const randomIndex = Math.floor(Math.random() * ballPool.length);
+    const drawnNumber = ballPool.splice(randomIndex, 1)[0];
+    drawnBallsHistory.push(drawnNumber);
+    
+    // Broadcast newly called number to room
+    io.emit('ball_drawn', {
+      number: drawnNumber,
+      pool: drawnBallsHistory
+    });
+  }, 3000); // Calls a new number every 3 seconds
+}
+
+function handleMatchOver(winnerName, cardNum) {
+  if (gameBallInterval) clearInterval(gameBallInterval);
+  globalGameState = "waiting";
+  timeRemaining = 15; // Give players time to view modal before starting next registration cycle
+  io.emit('opponent_victory', { winnerName, cardNum });
+  currentActiveGameRoundId = Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+io.on('connection', (socket) => {
+  socket.emit('room_tick', {
+    gameId: currentActiveGameRoundId,
+    state: globalGameState,
+    timeRemaining: timeRemaining
+  });
+
+  // Safeguard against duplicate listeners stacking on active communication pipes
+  socket.removeAllListeners('claim_bingo');
+
+  // Handle incoming manual/auto validation check requests
+  socket.on('claim_bingo', (data) => {
+    if (globalGameState === "playing") {
+      handleMatchOver(data.username || "Anonymous Player", data.cardNum);
+    }
+  });
+
+  socket.on('disconnect', (reason) => {
+    socket.removeAllListeners();
   });
 });
 
-const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => {
-  console.log(`🚀 Fast Bingo backend running on port ${PORT}`);
+httpServer.listen(PORT, () => {
+  console.log(`⚡ Fast Bingo backend engine optimized and running on port ${PORT}`);
 });

@@ -8,25 +8,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Create HTTP Server
 const server = http.createServer(app);
-
-// Initialize Socket.io properly on the server instance
 const io = new Server(server, {
-  cors: {
-    origin: "*", // Adjust to your actual frontend domain when ready
-    methods: ["GET", "POST"]
-  }
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// Mock or configure your Supabase Client here
-const SUPABASE_URL = process.env.SUPABASE_URL || "https://your-project.supabase.co";
-const SUPABASE_KEY = process.env.SUPABASE_KEY || "your-anon-key";
+// Ground connection to your live environment variables
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 console.log("🌲 Supabase client initialized successfully.");
 
-// --- STATE SYNCHRONIZATION AND BALL ENGINE TERMINATION ---
+// --- STATE MANAGEMENT ---
 let gameLoopState = "waiting"; 
 let countdownTimer = 40;
 let pulledNumbersPool = [];
@@ -41,16 +35,19 @@ function resetAvailableBalls() {
 }
 resetAvailableBalls();
 
-// Lobby countdown loop
-setInterval(() => {
+// Core Lobby Countdown Ticker Loop
+setInterval(async () => {
   if (gameLoopState === "waiting") {
     countdownTimer--;
+    
+    // Broadcast countdown timer live to all active sockets
     io.emit('room_tick', { state: "waiting", timeRemaining: countdownTimer });
     
     if (countdownTimer <= 0) {
       gameLoopState = "playing";
       countdownTimer = 40;
-      currentActiveGameId = "DB" + Math.random().toString(36).substr(2, 6).toUpperCase();
+      currentActiveGameId = "GM" + Math.floor(100000 + Math.random() * 900000);
+      
       io.emit('room_tick', { state: "playing", timeRemaining: 0, gameId: currentActiveGameId });
       startBallDroppingEngine();
     }
@@ -62,7 +59,6 @@ function startBallDroppingEngine() {
   resetAvailableBalls();
   
   gameIntervalLoop = setInterval(async () => {
-    // Stop loops immediately if the state changes due to a win
     if (gameLoopState !== "playing" || availableBalls.length === 0) {
       clearInterval(gameIntervalLoop);
       return;
@@ -72,30 +68,72 @@ function startBallDroppingEngine() {
     pulledNumbersPool.push(ballNumber);
     
     io.emit('ball_drawn', { number: ballNumber });
-
-    try {
-      if (supabase && currentActiveGameId) {
-        await supabase.from('games').update({ drawn_numbers: pulledNumbersPool }).eq('game_id', currentActiveGameId);
-      }
-    } catch (err) {
-      console.error("Supabase update skipped or errored:", err.message);
-    }
   }, 3500); 
 }
 
 function handleGameTerminatingVictory() {
   if (gameIntervalLoop) clearInterval(gameIntervalLoop);
   gameLoopState = "waiting";
-  countdownTimer = 12; // Gives 7 seconds for presentation layout + 5 seconds buffer before next round
+  countdownTimer = 12; // 7 seconds animation presentation + 5 seconds countdown transition buffer
 }
 
-// --- SOCKET CONNECTIONS ---
+// --- SECURE AUTH & MANAGEMENT API ENDPOINTS ---
+app.post('/api/register', async (req, res) => {
+  const { username, phone_number } = req.body;
+  try {
+    // Check if player exists by phone number first
+    let { data: player, error } = await supabase
+      .from('players')
+      .select('*')
+      .eq('phone_number', phone_number)
+      .single();
+
+    if (!player) {
+      // Create new account if phone number is new
+      const { data: newPlayer, error: insError } = await supabase
+        .from('players')
+        .insert([{ username, phone_number, balance: 100 }]) // Gift starter 100 ETB balance
+        .select()
+        .single();
+        
+      if (insError) throw insError;
+      player = newPlayer;
+    }
+    res.json({ user: player });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/player/:id', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('players')
+      .select('*')
+      .eq('player_id', req.params.id)
+      .single();
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/player/update-balance', async (req, res) => {
+  const { id, balance } = req.body;
+  try {
+    await supabase.from('players').update({ balance }).eq('player_id', id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- SOCKET SOCKET HANDLERS ---
 io.on('connection', (socket) => {
   console.log(`⚡ Player Connected: ${socket.id}`);
 
   socket.on('claim_bingo', (data) => {
     if (gameLoopState === "playing") {
-      console.log(`🏆 BINGO Claimed by: ${data.username}`);
       handleGameTerminatingVictory();
       io.emit('opponent_victory', {
         winnerName: data.username,
@@ -109,31 +147,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// --- REST ENDPOINTS PLACEHOLDERS ---
-app.post('/api/register', (req, res) => {
-  const { username, phone_number } = req.body;
-  // Temporary mock payload profile structure
-  res.json({ user: { player_id: "p_" + Math.floor(Math.random()*10000), username, phone_number, balance: 10 } });
-});
-
-app.get('/api/player/:id', (req, res) => {
-  res.json({ player_id: req.params.id, balance: 10 });
-});
-
-app.post('/api/player/update-balance', (req, res) => {
-  res.json({ success: true });
-});
-
-app.post('/api/games/create', (req, res) => {
-  res.json({ success: true });
-});
-
-app.post('/api/games/update-status', (req, res) => {
-  res.json({ success: true });
-});
-
-// Bind to port 10000 for Render deployment compatibility
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log(`🚀 Fast Bingo backend is running on port ${PORT}`);
+  console.log(`🚀 Fast Bingo backend running on port ${PORT}`);
 });

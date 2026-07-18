@@ -38,7 +38,7 @@ app.get('/api/health-check', async (req, res) => {
     return res.status(500).json({ status: "offline", error: "Supabase client not initialized" });
   }
   try {
-    const { error } = await supabase.from('players').select('id').limit(1);
+    const { error } = await supabase.from('players').select('player_id').limit(1);
     if (error) throw error;
     res.json({ status: "online", database: "connected" });
   } catch (err) {
@@ -58,7 +58,7 @@ app.post('/api/register', async (req, res) => {
       return res.json({ isNew: false, user: player });
     }
     const { data: newPlayer, error: insErr } = await supabase.from('players').insert([{
-      username, phone_number, wallet_main: 0, wallet_play: 10
+      username, phone_number, balance: 10
     }]).select().single();
     if (insErr) throw insErr;
     res.json({ isNew: true, user: newPlayer });
@@ -70,27 +70,53 @@ app.post('/api/register', async (req, res) => {
 app.get('/api/player/:id', async (req, res) => {
   if (!supabase) return res.status(500).json({ error: "Database offline" });
   try {
-    const { data, error } = await supabase.from('players').select('*').eq('id', req.params.id).single();
+    const { data, error } = await supabase.from('players').select('*').eq('player_id', req.params.id).single();
     if (error) throw error;
     res.json(data);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/player/update-balance', async (req, res) => {
-  const { id, wallet_main, wallet_play } = req.body;
+  const { id, balance } = req.body;
   if (!supabase) return res.status(500).json({ error: "Database offline" });
   try {
-    const { data, error } = await supabase.from('players').update({ wallet_main, wallet_play }).eq('id', id).select().single();
+    const { data, error } = await supabase.from('players').update({ balance }).eq('player_id', id).select().single();
     if (error) throw error;
     res.json(data);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/games/create', async (req, res) => {
-  res.json({ success: true, message: "Logged locally in-memory match context." });
+  const { player_id, game_id, cards_bought } = req.body;
+  if (!supabase) return res.status(500).json({ error: "Database offline" });
+  try {
+    // 1. Ensure game record exists
+    const { error: gameErr } = await supabase.from('games').insert([{ game_id, status: 'playing', drawn_numbers: [] }]);
+    if (gameErr && gameErr.code !== '23505') throw gameErr; // Ignore if already exists
+
+    // 2. Add player as participant
+    const { error: partErr } = await supabase.from('game_participants').insert([{
+      game_id,
+      player_id,
+      purchased_cards: cards_bought,
+      is_winner: false
+    }]);
+    if (partErr) throw partErr;
+
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 app.post('/api/games/update-status', async (req, res) => {
-  res.json({ success: true });
+  const { game_id, player_id, status, is_winner } = req.body;
+  if (!supabase) return res.status(500).json({ error: "Database offline" });
+  try {
+    await supabase.from('games').update({ status }).eq('game_id', game_id);
+    if (player_id) {
+      await supabase.from('game_participants').update({ is_winner }).eq('game_id', game_id).eq('player_id', player_id);
+    }
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/', (req, res) => {
@@ -98,11 +124,12 @@ app.get('/', (req, res) => {
 });
 
 // --- CORE GAME STATE MACHINE (SERVER-AUTHORITATIVE) ---
-let gameLoopState = "waiting"; // "waiting" or "playing"
+let gameLoopState = "waiting"; 
 let countdownTimer = 40;
 let pulledNumbersPool = [];
 let availableBalls = [];
 let gameIntervalLoop = null;
+let currentActiveGameId = null;
 
 function resetAvailableBalls() {
   availableBalls = [];
@@ -111,7 +138,6 @@ function resetAvailableBalls() {
 }
 resetAvailableBalls();
 
-// Central Clock Interval Tick Handler
 setInterval(() => {
   if (gameLoopState === "waiting") {
     countdownTimer--;
@@ -120,7 +146,8 @@ setInterval(() => {
     if (countdownTimer <= 0) {
       gameLoopState = "playing";
       countdownTimer = 40;
-      io.emit('room_tick', { state: "playing", timeRemaining: 0 });
+      currentActiveGameId = "DB" + Math.random().toString(36).substr(2, 6).toUpperCase();
+      io.emit('room_tick', { state: "playing", timeRemaining: 0, gameId: currentActiveGameId });
       startBallDroppingEngine();
     }
   }
@@ -130,7 +157,7 @@ function startBallDroppingEngine() {
   if (gameIntervalLoop) clearInterval(gameIntervalLoop);
   resetAvailableBalls();
   
-  gameIntervalLoop = setInterval(() => {
+  gameIntervalLoop = setInterval(async () => {
     if (gameLoopState !== "playing" || availableBalls.length === 0) {
       clearInterval(gameIntervalLoop);
       return;
@@ -140,13 +167,17 @@ function startBallDroppingEngine() {
     pulledNumbersPool.push(ballNumber);
     
     io.emit('ball_drawn', { number: ballNumber });
-  }, 3500); // Draw standard intermediate balls every 3.5 seconds
+
+    if (supabase && currentActiveGameId) {
+      await supabase.from('games').update({ drawn_numbers: pulledNumbersPool }).eq('game_id', currentActiveGameId);
+    }
+  }, 3500); 
 }
 
-function handleGameTerminatingVictory(winnerName, winningCard) {
+function handleGameTerminatingVictory() {
   if (gameIntervalLoop) clearInterval(gameIntervalLoop);
   gameLoopState = "waiting";
-  countdownTimer = 15; // Set a 15s intermission for players before starting a new round
+  countdownTimer = 15; 
 }
 
 // --- SOCKET CONNECTIONS ---
@@ -164,8 +195,8 @@ io.on('connection', (socket) => {
   });
 
   socket.on('claim_bingo', (data) => {
-    console.log(`🏆 BINGO Claimed by: ${data.username} on Card: #${data.cardNum}`);
-    handleGameTerminatingVictory(data.username, data.cardNum);
+    console.log(`🏆 BINGO Claimed by: ${data.username}`);
+    handleGameTerminatingVictory();
     io.emit('opponent_victory', {
       winnerName: data.username,
       cardNum: data.cardNum

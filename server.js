@@ -82,7 +82,7 @@ app.get('/api/player/:id', async (req, res) => {
   }
 });
 
-// 4. Update Balance (Fixed property reading to accommodate 'id' or 'player_id')
+// 4. Update Balance
 app.post('/api/player/update-balance', async (req, res) => {
   const { id, player_id, balance } = req.body;
   const targetId = player_id || id;
@@ -138,12 +138,11 @@ app.post('/api/games/update-status', async (req, res) => {
   }
 });
 
-// 7. GET Game History for a specific player (Hardened Internal Fix)
+// 7. GET Game History for a specific player
 app.get('/api/history/:player_id', async (req, res) => {
   try {
     const { player_id } = req.params;
 
-    // Validate parameters cleanly against empty states or literal corruption flags
     if (!player_id || player_id === 'undefined' || player_id === 'null' || player_id === '[object Object]') {
       return res.status(200).json([]);
     }
@@ -174,7 +173,6 @@ let ballPool = [];
 let drawnBallsHistory = [];
 let gameBallInterval = null;
 
-// Populate initial available balls array (1 to 75)
 function resetBallPool() {
   ballPool = [];
   drawnBallsHistory = [];
@@ -182,20 +180,28 @@ function resetBallPool() {
 }
 resetBallPool();
 
-// Central 1-second room timer ticker
+// Cleaned up Room Timer Loop (With Automatic Match Timeout Recovery)
 setInterval(() => {
   if (globalGameState === "waiting") {
     timeRemaining--;
     if (timeRemaining <= 0) {
-      // Transition to active gaming match
       globalGameState = "playing";
-      timeRemaining = 120; // fallback max duration limits
+      timeRemaining = 60; // Max match duration for active testing rounds
       resetBallPool();
       startBallDrawingSequence();
     }
+  } else if (globalGameState === "playing") {
+    timeRemaining--;
+    if (timeRemaining <= 0) {
+      // Closes stale or un-won games automatically to open testing loops back up
+      if (gameBallInterval) clearInterval(gameBallInterval);
+      globalGameState = "waiting";
+      timeRemaining = 30; 
+      currentActiveGameRoundId = Math.floor(100000 + Math.random() * 900000).toString();
+      io.emit('opponent_victory', { winnerName: "No one (Game Timeout)", cardNum: "N/A" });
+    }
   }
   
-  // Emitting the exact event schema and channel expected by client UI
   io.emit('room_tick', {
     gameId: currentActiveGameRoundId,
     state: globalGameState,
@@ -212,23 +218,21 @@ function startBallDrawingSequence() {
       return;
     }
     
-    // Draw random number from pool
     const randomIndex = Math.floor(Math.random() * ballPool.length);
     const drawnNumber = ballPool.splice(randomIndex, 1)[0];
     drawnBallsHistory.push(drawnNumber);
     
-    // Broadcast newly called number to room
     io.emit('ball_drawn', {
       number: drawnNumber,
       pool: drawnBallsHistory
     });
-  }, 3000); // Calls a new number every 3 seconds
+  }, 3000);
 }
 
 function handleMatchOver(winnerName, cardNum) {
   if (gameBallInterval) clearInterval(gameBallInterval);
   globalGameState = "waiting";
-  timeRemaining = 15; // Give players time to view modal before starting next registration cycle
+  timeRemaining = 15; 
   io.emit('opponent_victory', { winnerName, cardNum });
   currentActiveGameRoundId = Math.floor(100000 + Math.random() * 900000).toString();
 }
@@ -240,10 +244,8 @@ io.on('connection', (socket) => {
     timeRemaining: timeRemaining
   });
 
-  // Safeguard against duplicate listeners stacking on active communication pipes
   socket.removeAllListeners('claim_bingo');
 
-  // Handle incoming manual/auto validation check requests
   socket.on('claim_bingo', (data) => {
     if (globalGameState === "playing") {
       handleMatchOver(data.username || "Anonymous Player", data.cardNum);

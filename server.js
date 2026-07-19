@@ -65,14 +65,15 @@ app.post('/api/register', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-// 8. Check Active Match Re-entry Status
+
+// 8. Check Active Match Re-entry Status (Fixed to support absolute layout preservation)
 app.get('/api/games/check-active/:player_id/:game_id', async (req, res) => {
   try {
     const { player_id, game_id } = req.params;
     
     const { data, error } = await supabase
       .from('game_participants')
-      .select('purchased_cards, is_winner')
+      .select('purchased_cards, is_winner, metadata')
       .eq('player_id', player_id)
       .eq('game_id', game_id)
       .maybeSingle();
@@ -80,7 +81,18 @@ app.get('/api/games/check-active/:player_id/:game_id', async (req, res) => {
     if (error) throw error;
     
     if (data) {
-      return res.json({ registered: true, cards_bought: data.purchased_cards, is_winner: data.is_winner });
+      let cardsList = [117]; 
+      if (data.metadata && data.metadata.cards) {
+        cardsList = data.metadata.cards;
+      } else if (data.purchased_cards === 2) {
+        cardsList = [117, 118];
+      }
+      return res.json({ 
+        registered: true, 
+        cards_bought: data.purchased_cards, 
+        is_winner: data.is_winner,
+        cards_list: cardsList
+      });
     } else {
       return res.json({ registered: false });
     }
@@ -88,6 +100,7 @@ app.get('/api/games/check-active/:player_id/:game_id', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 // 3. Sync Player Profile/Balances
 app.get('/api/player/:id', async (req, res) => {
   try {
@@ -125,7 +138,7 @@ app.post('/api/player/update-balance', async (req, res) => {
 
 // 5. Join Game Session
 app.post('/api/games/create', async (req, res) => {
-  const { player_id, game_id, cards_bought } = req.body;
+  const { player_id, game_id, cards_bought, cards_list } = req.body;
   try {
     const { data, error } = await supabase
       .from('game_participants')
@@ -133,7 +146,8 @@ app.post('/api/games/create', async (req, res) => {
         player_id, 
         game_id, 
         purchased_cards: cards_bought, 
-        is_winner: false 
+        is_winner: false,
+        metadata: { cards: cards_list || [117] }
       }]);
 
     if (error) throw error;
@@ -160,29 +174,21 @@ app.post('/api/games/update-status', async (req, res) => {
   }
 });
 
-// 7. GET Game History for a specific player
+// 7. GET Game History
 app.get('/api/history/:player_id', async (req, res) => {
   try {
     const { player_id } = req.params;
-
-    if (!player_id || player_id === 'undefined' || player_id === 'null' || player_id === '[object Object]') {
+    if (!player_id || player_id === 'undefined' || player_id === 'null') {
       return res.status(200).json([]);
     }
-
     const { data, error } = await supabase
       .from('game_participants') 
       .select('game_id, purchased_cards, is_winner')
       .eq('player_id', player_id);
 
-    if (error) {
-      console.error(`Supabase database query error for player ${player_id}:`, error.message);
-      return res.status(200).json([]); 
-    }
-
+    if (error) throw error;
     return res.status(200).json(data || []);
-
   } catch (catchErr) {
-    console.error("Critical failure inside GET /api/history route handler:", catchErr);
     return res.status(200).json([]); 
   }
 });
@@ -202,20 +208,18 @@ function resetBallPool() {
 }
 resetBallPool();
 
-// Cleaned up Room Timer Loop (With Automatic Match Timeout Recovery)
 setInterval(() => {
   if (globalGameState === "waiting") {
     timeRemaining--;
     if (timeRemaining <= 0) {
       globalGameState = "playing";
-      timeRemaining = 60; // Max match duration for active testing rounds
+      timeRemaining = 60; 
       resetBallPool();
       startBallDrawingSequence();
     }
   } else if (globalGameState === "playing") {
     timeRemaining--;
     if (timeRemaining <= 0) {
-      // Closes stale or un-won games automatically to open testing loops back up
       if (gameBallInterval) clearInterval(gameBallInterval);
       globalGameState = "waiting";
       timeRemaining = 30; 
@@ -266,15 +270,13 @@ io.on('connection', (socket) => {
     timeRemaining: timeRemaining
   });
 
-  socket.removeAllListeners('claim_bingo');
-
   socket.on('claim_bingo', (data) => {
     if (globalGameState === "playing") {
       handleMatchOver(data.username || "Anonymous Player", data.cardNum);
     }
   });
 
-  socket.on('disconnect', (reason) => {
+  socket.on('disconnect', () => {
     socket.removeAllListeners();
   });
 });

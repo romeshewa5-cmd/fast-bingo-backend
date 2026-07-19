@@ -264,6 +264,9 @@ function handleMatchOver(winnerName, cardNum) {
 }
 
 io.on('connection', (socket) => {
+  // Clear any existing listeners on the specific socket instance channel to prevent memory bloat
+  socket.removeAllListeners('claim_bingo');
+
   socket.emit('room_tick', {
     gameId: currentActiveGameRoundId,
     state: globalGameState,
@@ -277,6 +280,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
+    // Graceful clean connection cycle termination
     socket.removeAllListeners();
   });
 });

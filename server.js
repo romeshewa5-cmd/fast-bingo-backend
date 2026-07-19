@@ -22,7 +22,6 @@ const io = new Server(httpServer, {
 
 // --- API ROUTES ---
 
-// 1. Health Check
 app.get('/api/health-check', async (req, res) => {
   try {
     const { error } = await supabase.from('players').select('count', { count: 'exact', head: true });
@@ -33,13 +32,11 @@ app.get('/api/health-check', async (req, res) => {
   }
 });
 
-// 2. Player Registration / Authentication
 app.post('/api/register', async (req, res) => {
   const { username, phone_number } = req.body;
   if (!username || !phone_number) {
     return res.status(400).json({ error: "Username and Phone Number are required." });
   }
-
   try {
     let { data: player, error } = await supabase
       .from('players')
@@ -66,11 +63,10 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// 8. Check Active Match Re-entry Status (Fixed to support absolute layout preservation)
+// Check Active Match Re-entry Status
 app.get('/api/games/check-active/:player_id/:game_id', async (req, res) => {
   try {
     const { player_id, game_id } = req.params;
-    
     const { data, error } = await supabase
       .from('game_participants')
       .select('purchased_cards, is_winner, metadata')
@@ -101,7 +97,6 @@ app.get('/api/games/check-active/:player_id/:game_id', async (req, res) => {
   }
 });
 
-// 3. Sync Player Profile/Balances
 app.get('/api/player/:id', async (req, res) => {
   try {
     const { data: player, error } = await supabase
@@ -117,7 +112,6 @@ app.get('/api/player/:id', async (req, res) => {
   }
 });
 
-// 4. Update Balance
 app.post('/api/player/update-balance', async (req, res) => {
   const { id, player_id, balance } = req.body;
   const targetId = player_id || id;
@@ -136,7 +130,6 @@ app.post('/api/player/update-balance', async (req, res) => {
   }
 });
 
-// 5. Join Game Session
 app.post('/api/games/create', async (req, res) => {
   const { player_id, game_id, cards_bought, cards_list } = req.body;
   try {
@@ -157,7 +150,6 @@ app.post('/api/games/create', async (req, res) => {
   }
 });
 
-// 6. Update Winner Status
 app.post('/api/games/update-status', async (req, res) => {
   const { game_id, player_id, is_winner } = req.body;
   try {
@@ -174,7 +166,6 @@ app.post('/api/games/update-status', async (req, res) => {
   }
 });
 
-// 7. GET Game History
 app.get('/api/history/:player_id', async (req, res) => {
   try {
     const { player_id } = req.params;
@@ -193,7 +184,7 @@ app.get('/api/history/:player_id', async (req, res) => {
   }
 });
 
-// --- SERVER AUTHORITATIVE BINGO CORE LOOP ---
+// --- SERVER BINGO LOOP ---
 let globalGameState = "waiting"; 
 let timeRemaining = 40;
 let currentActiveGameRoundId = Math.floor(100000 + Math.random() * 900000).toString();
@@ -231,19 +222,18 @@ setInterval(() => {
   io.emit('room_tick', {
     gameId: currentActiveGameRoundId,
     state: globalGameState,
-    timeRemaining: timeRemaining
+    timeRemaining: timeRemaining,
+    drawnHistory: drawnBallsHistory
   });
 }, 1000);
 
 function startBallDrawingSequence() {
   if (gameBallInterval) clearInterval(gameBallInterval);
-  
   gameBallInterval = setInterval(() => {
     if (globalGameState !== "playing" || ballPool.length === 0) {
       clearInterval(gameBallInterval);
       return;
     }
-    
     const randomIndex = Math.floor(Math.random() * ballPool.length);
     const drawnNumber = ballPool.splice(randomIndex, 1)[0];
     drawnBallsHistory.push(drawnNumber);
@@ -264,15 +254,13 @@ function handleMatchOver(winnerName, cardNum) {
 }
 
 io.on('connection', (socket) => {
-  // Clear any existing listeners on the specific socket instance channel to prevent memory bloat
   socket.removeAllListeners('claim_bingo');
 
-  // ENRICHED TICK PACKET: Provide drawn balls history pool so returning players instantly recover game context
   socket.emit('room_tick', {
     gameId: currentActiveGameRoundId,
     state: globalGameState,
     timeRemaining: timeRemaining,
-    drawnHistory: drawnBallsHistory // Injected for late reconnect sync support
+    drawnHistory: drawnBallsHistory
   });
 
   socket.on('claim_bingo', (data) => {
@@ -282,7 +270,6 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    // Graceful clean connection cycle termination
     socket.removeAllListeners();
   });
 });

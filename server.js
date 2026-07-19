@@ -267,10 +267,12 @@ io.on('connection', (socket) => {
   // Clear any existing listeners on the specific socket instance channel to prevent memory bloat
   socket.removeAllListeners('claim_bingo');
 
+  // ENRICHED TICK PACKET: Provide drawn balls history pool so returning players instantly recover game context
   socket.emit('room_tick', {
     gameId: currentActiveGameRoundId,
     state: globalGameState,
-    timeRemaining: timeRemaining
+    timeRemaining: timeRemaining,
+    drawnHistory: drawnBallsHistory // Injected for late reconnect sync support
   });
 
   socket.on('claim_bingo', (data) => {

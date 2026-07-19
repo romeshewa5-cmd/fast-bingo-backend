@@ -65,7 +65,29 @@ app.post('/api/register', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// 8. Check Active Match Re-entry Status
+app.get('/api/games/check-active/:player_id/:game_id', async (req, res) => {
+  try {
+    const { player_id, game_id } = req.params;
+    
+    const { data, error } = await supabase
+      .from('game_participants')
+      .select('purchased_cards, is_winner')
+      .eq('player_id', player_id)
+      .eq('game_id', game_id)
+      .maybeSingle();
 
+    if (error) throw error;
+    
+    if (data) {
+      return res.json({ registered: true, cards_bought: data.purchased_cards, is_winner: data.is_winner });
+    } else {
+      return res.json({ registered: false });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 // 3. Sync Player Profile/Balances
 app.get('/api/player/:id', async (req, res) => {
   try {

@@ -141,12 +141,14 @@ app.post('/api/games/create', async (req, res) => {
         purchased_cards: cards_bought, 
         is_winner: false,
         metadata: { cards: cards_list || [117] }
-      }]);
+      }])
+      .select()
+      .single();
 
     if (error) throw error;
-    res.json({ success: true });
+    res.json({ success: true, participant: data });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -185,9 +187,46 @@ app.get('/api/history/:player_id', async (req, res) => {
 });
 
 // --- SERVER BINGO LOOP ---
+function generateRoundId() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// Mirrors the client's card generation exactly (same seeded PRNG) so the
+// server can independently verify a claimed card without trusting the client.
+function seededRand(s) {
+  return () => { s = (s * 1664525 + 1013904223) & 0xFFFFFFFF; return (s >>> 0) / 0xFFFFFFFF; };
+}
+function genCard(n) {
+  const r = seededRand(n * 31337);
+  const ranges = [[1, 15], [16, 30], [31, 45], [46, 60], [61, 75]];
+  const card = ranges.map(([lo, hi]) => {
+    const pool = [];
+    for (let i = lo; i <= hi; i++) pool.push(i);
+    const picks = [];
+    while (picks.length < 5) {
+      const idx = Math.floor(r() * pool.length);
+      picks.push(pool.splice(idx, 1)[0]);
+    }
+    return picks;
+  });
+  card[2][2] = 0;
+  return card;
+}
+// Checks only rows/columns (no diagonals), matching the client's own win check.
+function cardHasWinningLine(cardNum, drawnNumbers) {
+  const card = genCard(cardNum);
+  const calledSet = new Set(drawnNumbers);
+  const isMarked = (c, r) => card[c][r] === 0 || calledSet.has(card[c][r]);
+  for (let i = 0; i < 5; i++) {
+    if ([0, 1, 2, 3, 4].every(j => isMarked(j, i))) return true; // row i
+    if ([0, 1, 2, 3, 4].every(j => isMarked(i, j))) return true; // column i
+  }
+  return false;
+}
+
 let globalGameState = "waiting"; 
 let timeRemaining = 40;
-let currentActiveGameRoundId = Math.floor(100000 + Math.random() * 900000).toString();
+let currentActiveGameRoundId = generateRoundId();
 let ballPool = [];
 let drawnBallsHistory = [];
 let gameBallInterval = null;
@@ -204,20 +243,14 @@ setInterval(() => {
     timeRemaining--;
     if (timeRemaining <= 0) {
       globalGameState = "playing";
-      timeRemaining = 60; 
       resetBallPool();
       startBallDrawingSequence();
     }
-  } else if (globalGameState === "playing") {
-    timeRemaining--;
-    if (timeRemaining <= 0) {
-      if (gameBallInterval) clearInterval(gameBallInterval);
-      globalGameState = "waiting";
-      timeRemaining = 30; 
-      currentActiveGameRoundId = Math.floor(100000 + Math.random() * 900000).toString();
-      io.emit('opponent_victory', { winnerName: "No one (Game Timeout)", cardNum: "N/A" });
-    }
   }
+  // No time-based cutoff while "playing" — the round runs until either a
+  // validated win comes in via claim_bingo, or the ball pool is exhausted
+  // (see startBallDrawingSequence), so every one of the 75 balls gets a chance
+  // to be called before a round is declared a draw.
   
   io.emit('room_tick', {
     gameId: currentActiveGameRoundId,
@@ -230,8 +263,17 @@ setInterval(() => {
 function startBallDrawingSequence() {
   if (gameBallInterval) clearInterval(gameBallInterval);
   gameBallInterval = setInterval(() => {
-    if (globalGameState !== "playing" || ballPool.length === 0) {
+    if (globalGameState !== "playing") {
       clearInterval(gameBallInterval);
+      return;
+    }
+    if (ballPool.length === 0) {
+      // All 75 numbers have been called with no valid winner -> declare a draw.
+      clearInterval(gameBallInterval);
+      globalGameState = "waiting";
+      timeRemaining = 30;
+      currentActiveGameRoundId = generateRoundId();
+      io.emit('opponent_victory', { winnerName: "No one (All Numbers Called)", cardNum: "N/A", winnerPlayerId: null });
       return;
     }
     const randomIndex = Math.floor(Math.random() * ballPool.length);
@@ -245,12 +287,12 @@ function startBallDrawingSequence() {
   }, 3000);
 }
 
-function handleMatchOver(winnerName, cardNum) {
+function handleMatchOver(winnerName, cardNum, winnerPlayerId) {
   if (gameBallInterval) clearInterval(gameBallInterval);
   globalGameState = "waiting";
   timeRemaining = 15; 
-  io.emit('opponent_victory', { winnerName, cardNum });
-  currentActiveGameRoundId = Math.floor(100000 + Math.random() * 900000).toString();
+  io.emit('opponent_victory', { winnerName, cardNum, winnerPlayerId });
+  currentActiveGameRoundId = generateRoundId();
 }
 
 io.on('connection', (socket) => {
@@ -263,9 +305,42 @@ io.on('connection', (socket) => {
     drawnHistory: drawnBallsHistory
   });
 
-  socket.on('claim_bingo', (data) => {
-    if (globalGameState === "playing") {
-      handleMatchOver(data.username || "Anonymous Player", data.cardNum);
+  socket.on('claim_bingo', async (data) => {
+    if (globalGameState !== "playing") return;
+    const { player_id, cardNum } = data || {};
+    if (!player_id || !cardNum) return;
+
+    try {
+      const { data: participant, error: pErr } = await supabase
+        .from('game_participants')
+        .select('metadata, purchased_cards, is_winner')
+        .eq('player_id', player_id)
+        .eq('game_id', currentActiveGameRoundId)
+        .maybeSingle();
+
+      if (pErr || !participant) return; // not a registered participant for this round
+      if (participant.is_winner) return; // already recorded as the winner, avoid double-processing
+
+      const ownedCards = (participant.metadata && participant.metadata.cards) || [117];
+      if (!ownedCards.includes(Number(cardNum))) return; // claiming a card they don't actually own
+
+      if (!cardHasWinningLine(Number(cardNum), drawnBallsHistory)) return; // not a real completed line
+
+      const { data: player } = await supabase
+        .from('players')
+        .select('username')
+        .eq('player_id', player_id)
+        .single();
+
+      await supabase
+        .from('game_participants')
+        .update({ is_winner: true })
+        .eq('game_id', currentActiveGameRoundId)
+        .eq('player_id', player_id);
+
+      handleMatchOver(player?.username || "Player", cardNum, player_id);
+    } catch (err) {
+      console.error("claim_bingo validation error:", err.message);
     }
   });
 

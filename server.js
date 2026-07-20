@@ -15,6 +15,10 @@ const supabaseUrl = process.env.SUPABASE_URL || "https://rsmobdnuyxqyynxtjkyi.su
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+// Game economy constants - authoritative on the server, never trusted from the client.
+const CARD_PRICE = 10;
+const WIN_PAYOUT = 304;
+
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] }
@@ -112,27 +116,53 @@ app.get('/api/player/:id', async (req, res) => {
   }
 });
 
-app.post('/api/player/update-balance', async (req, res) => {
-  const { id, player_id, balance } = req.body;
-  const targetId = player_id || id;
-  try {
-    const { data, error } = await supabase
-      .from('players')
-      .update({ balance })
-      .eq('player_id', targetId)
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// NOTE: the old /api/player/update-balance endpoint has been removed.
+// It used to accept a raw balance value straight from the client with no
+// validation, meaning anyone who knew a player_id could set their own
+// balance to anything. Balance is now only ever changed server-side:
+// entry fees are deducted in /api/games/create, and payouts are credited
+// in the claim_bingo socket handler below - both computed from
+// server-controlled constants (CARD_PRICE, WIN_PAYOUT), never from
+// client input.
 
 app.post('/api/games/create', async (req, res) => {
   const { player_id, game_id, cards_bought, cards_list } = req.body;
+  if (!player_id || !game_id || !cards_bought) {
+    return res.status(400).json({ success: false, error: "Missing required fields." });
+  }
+
+  const cost = CARD_PRICE * Number(cards_bought);
+
   try {
+    // Prevent joining the same round twice (e.g. a replayed/duplicate request)
+    const { data: existing } = await supabase
+      .from('game_participants')
+      .select('player_id')
+      .eq('player_id', player_id)
+      .eq('game_id', game_id)
+      .maybeSingle();
+    if (existing) {
+      return res.status(400).json({ success: false, error: "already_registered" });
+    }
+
+    const { data: player, error: playerErr } = await supabase
+      .from('players')
+      .select('balance')
+      .eq('player_id', player_id)
+      .single();
+    if (playerErr || !player) throw playerErr || new Error("Player not found.");
+
+    if (player.balance < cost) {
+      return res.status(400).json({ success: false, error: "insufficient_balance" });
+    }
+
+    const newBalance = player.balance - cost;
+    const { error: balErr } = await supabase
+      .from('players')
+      .update({ balance: newBalance })
+      .eq('player_id', player_id);
+    if (balErr) throw balErr;
+
     const { data, error } = await supabase
       .from('game_participants')
       .insert([{ 
@@ -145,8 +175,15 @@ app.post('/api/games/create', async (req, res) => {
       .select()
       .single();
 
-    if (error) throw error;
-    res.json({ success: true, participant: data });
+    if (error) {
+      // Registration failed after the deduction - refund so the player isn't charged for nothing.
+      // Note: this is a best-effort rollback, not a real transaction. For full atomicity this
+      // whole flow should live inside a single Postgres function (RPC) instead.
+      await supabase.from('players').update({ balance: player.balance }).eq('player_id', player_id);
+      throw error;
+    }
+
+    res.json({ success: true, participant: data, balance: newBalance });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -326,11 +363,19 @@ io.on('connection', (socket) => {
 
       if (!cardHasWinningLine(Number(cardNum), drawnBallsHistory)) return; // not a real completed line
 
-      const { data: player } = await supabase
+      const { data: player, error: playerFetchErr } = await supabase
         .from('players')
-        .select('username')
+        .select('username, balance')
         .eq('player_id', player_id)
         .single();
+      if (playerFetchErr || !player) return;
+
+      const newBalance = (player.balance || 0) + WIN_PAYOUT;
+
+      await supabase
+        .from('players')
+        .update({ balance: newBalance })
+        .eq('player_id', player_id);
 
       await supabase
         .from('game_participants')

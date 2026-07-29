@@ -53,11 +53,15 @@ function sanitizePlayer(p) {
   const main = Number(p.main_balance ?? p.balance ?? 0);
   const play = Number(p.play_balance ?? 0);
   const total = main + play;
+  const refCount = Number(p.referrals_count ?? p.referral_count ?? 0);
+  const refEarned = Number(p.referral_earnings ?? (refCount * 5) ?? 0);
   return {
     ...p,
     main_balance: main,
     play_balance: play,
     balance: total,
+    referrals_count: refCount,
+    referral_earnings: refEarned,
   };
 }
 
@@ -135,7 +139,7 @@ app.get('/api/health-check', async (req, res) => {
 
 // Registration with 20 Birr Signup Bonus to Play Wallet
 app.post('/api/register', async (req, res) => {
-  const { username, phone_number } = req.body;
+  const { username, phone_number, referrer_id } = req.body;
   if (!username || !phone_number) {
     return res.status(400).json({ error: "Username and Phone Number are required." });
   }
@@ -157,7 +161,10 @@ app.post('/api/register', async (req, res) => {
         phone_number,
         main_balance: 0,
         play_balance: 20, // 20 Birr Bonus!
-        balance: 20
+        balance: 20,
+        referred_by: referrer_id || null,
+        referrals_count: 0,
+        referral_earnings: 0
       };
 
       let newPlayer = null;
@@ -170,7 +177,7 @@ app.post('/api/register', async (req, res) => {
         if (insertError) throw insertError;
         newPlayer = data;
       } catch (insertErr) {
-        // Fallback for older table schema without dual columns
+        // Fallback for older table schema without extra columns
         const { data, error: fbError } = await supabase
           .from('players')
           .insert([{ username, phone_number, balance: 20 }])
@@ -187,6 +194,54 @@ app.post('/api/register', async (req, res) => {
         balance_after: 20,
         notes: '20 Birr Registration Bonus credited to Play Wallet'
       });
+
+      // Handle Referrer Reward if referrer_id exists
+      if (referrer_id && String(referrer_id).trim()) {
+        const cleanRefId = String(referrer_id).trim();
+        try {
+          const { data: refPlayer } = await supabase
+            .from('players')
+            .select('*')
+            .eq('player_id', cleanRefId)
+            .single();
+
+          if (refPlayer && refPlayer.player_id !== newPlayer.player_id) {
+            const currentRefCount = Number(refPlayer.referrals_count ?? refPlayer.referral_count ?? 0) + 1;
+            const currentRefEarn = Number(refPlayer.referral_earnings ?? 0) + 5;
+
+            // Give +5 ETB to referrer Play Wallet
+            await creditPlayerBalances(refPlayer.player_id, {
+              playAdd: 5,
+              type: 'referral_bonus',
+              notes: `5 ETB referral reward for inviting ${username}`
+            });
+
+            // Safely update referrer stats
+            try {
+              await supabase
+                .from('players')
+                .update({
+                  referrals_count: currentRefCount,
+                  referral_earnings: currentRefEarn
+                })
+                .eq('player_id', refPlayer.player_id);
+            } catch (uErr) {
+              // Ignore if column doesn't exist
+            }
+
+            // Milestone bonus: 100 ETB for reaching 10 referrals (or multiples of 10)
+            if (currentRefCount % 10 === 0) {
+              await creditPlayerBalances(refPlayer.player_id, {
+                playAdd: 100,
+                type: 'referral_milestone_bonus',
+                notes: `🎉 100 ETB Milestone bonus for inviting ${currentRefCount} players!`
+              });
+            }
+          }
+        } catch (refErr) {
+          console.error("Referral processing error:", refErr.message);
+        }
+      }
 
       return res.json({ isNew: true, user: sanitizePlayer(newPlayer) });
     }
@@ -245,7 +300,12 @@ app.get('/api/player/:id', async (req, res) => {
       .eq('player_id', req.params.id)
       .single();
 
+    if (error && error.code === 'PGRST116') {
+      return res.status(404).json({ error: "Player not found" });
+    }
     if (error) throw error;
+    if (!player) return res.status(404).json({ error: "Player not found" });
+
     res.json(sanitizePlayer(player));
   } catch (err) {
     res.status(500).json({ error: err.message });

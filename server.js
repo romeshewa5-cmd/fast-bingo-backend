@@ -17,7 +17,12 @@ const {
 const app = express();
 const PORT = 3000;
 
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret", "X-Requested-With"]
+}));
 app.use(express.json());
 
 const supabaseUrl = process.env.SUPABASE_URL || "https://rsmobdnuyxqyynxtjkyi.supabase.co";
@@ -1095,6 +1100,12 @@ setInterval(async () => {
 
 // Socket.io Handlers
 io.on('connection', (socket) => {
+  socket.on('sync_player_profile', async (playerData) => {
+    if (playerData && playerData.player_id) {
+      await savePlayer(playerData);
+    }
+  });
+
   socket.emit('room_tick', {
     gameId: currentActiveGameRoundId,
     state: globalGameState,

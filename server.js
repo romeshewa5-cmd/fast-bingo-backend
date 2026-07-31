@@ -34,9 +34,13 @@ const CARD_PRICE = Number(process.env.CARD_PRICE) || 10;
 const PAYOUT_PERCENTAGE = Number(process.env.PAYOUT_PERCENTAGE) || 0.8;
 const MIN_PLAYERS_TO_START = Number(process.env.MIN_PLAYERS_TO_START) || 2;
 const INITIAL_WAIT_SECONDS = Number(process.env.INITIAL_WAIT_SECONDS) || 40;
-const RECHECK_WAIT_SECONDS = Number(process.env.RECHECK_WAIT_SECONDS) || 40; // Fixed: Loops back to 40 seconds
+const RECHECK_WAIT_SECONDS = Number(process.env.RECHECK_WAIT_SECONDS) || 40;
 const POST_ROUND_PAUSE_SECONDS = Number(process.env.POST_ROUND_PAUSE_SECONDS) || 15;
-const MIN_WITHDRAWAL_AMOUNT = Number(process.env.MIN_WITHDRAWAL_AMOUNT) || 100; // Minimum 100 ETB withdrawal
+const MIN_WITHDRAWAL_AMOUNT = Number(process.env.MIN_WITHDRAWAL_AMOUNT) || 100;
+
+// Signup and Telegram Group Bonus amounts
+const SIGNUP_BONUS = 10; // Base signup bonus in ETB
+const TG_GROUP_BONUS = 10; // Extra bonus for joining Telegram group
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -216,7 +220,7 @@ app.get('/api/health-check', async (req, res) => {
 
 // Registration with 10 Birr Signup Bonus to Play Wallet
 app.post('/api/register', async (req, res) => {
-  const { username, phone_number, referrer_id } = req.body;
+  const { username, phone_number, referrer_id, telegram_id } = req.body;
   if (!username || !phone_number) {
     return res.status(400).json({ error: "Username and Phone Number are required." });
   }
@@ -224,6 +228,7 @@ app.post('/api/register', async (req, res) => {
     let player = await findPlayerByPhone(phone_number);
 
     if (player) {
+      // Existing user - return their data
       return res.json({ isNew: false, user: sanitizePlayer(player) });
     } else {
       // New User Registration: 10 Birr Base Signup Bonus to Play Wallet!
@@ -232,13 +237,15 @@ app.post('/api/register', async (req, res) => {
         player_id: generatedId,
         username,
         phone_number,
+        telegram_id: telegram_id || null, // Store Telegram ID
         main_balance: 0,
-        play_balance: 10, // 10 Birr Base Bonus!
-        balance: 10,
+        play_balance: SIGNUP_BONUS, // 10 Birr Base Bonus!
+        balance: SIGNUP_BONUS,
         referred_by: referrer_id || null,
         referrals_count: 0,
         referral_earnings: 0,
-        tg_bonus_claimed: false,
+        tg_bonus_claimed: false, // Will be updated when they claim TG group bonus
+        tg_group_joined: false,
         created_at: new Date().toISOString()
       };
 
@@ -247,9 +254,9 @@ app.post('/api/register', async (req, res) => {
       await logTransaction({
         player_id: savedPlayer.player_id,
         type: 'signup_bonus',
-        amount: 10,
-        balance_after: 10,
-        notes: '10 Birr Registration Bonus credited to Play Wallet'
+        amount: SIGNUP_BONUS,
+        balance_after: SIGNUP_BONUS,
+        notes: `${SIGNUP_BONUS} Birr Registration Bonus credited to Play Wallet`
       });
 
       // Handle Referrer Reward if referrer_id exists
@@ -298,12 +305,18 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// Endpoint to claim Telegram Group Join Bonus (+10 ETB)
+// Endpoint to claim Telegram Group Join Bonus (+10 ETB extra if they joined)
 app.post('/api/claim-telegram-bonus', async (req, res) => {
-  const { player_id } = req.body;
+  const { player_id, claimed_tg_group } = req.body;
+  
   if (!player_id) {
     return res.status(400).json({ error: "Player ID is required." });
   }
+  
+  // claimed_tg_group: true = user clicked the group link AND verified → get +10 ETB extra
+  // claimed_tg_group: false = user skipped → no extra bonus
+  const shouldCreditTGGroupBonus = claimed_tg_group === true;
+  
   try {
     const player = await findPlayerById(player_id);
 
@@ -311,24 +324,47 @@ app.post('/api/claim-telegram-bonus', async (req, res) => {
       return res.status(404).json({ error: "Player not found." });
     }
 
+    // Check if already claimed
     if (player.tg_bonus_claimed) {
-      return res.json({ success: true, claimed: true, user: sanitizePlayer(player) });
+      return res.json({ success: true, claimed: true, user: sanitizePlayer(player), message: "Bonus already claimed" });
     }
 
-    // Credit +10 ETB to play_balance
+    // Credit bonuses to play_balance
+    // Base signup bonus (10 ETB) is already credited during registration
+    // If user joined TG group, credit the extra 10 ETB
+    let playAdd = 0;
+    let notes = '';
+    
+    if (shouldCreditTGGroupBonus) {
+      playAdd = TG_GROUP_BONUS; // +10 ETB for joining TG group
+      notes = `${TG_GROUP_BONUS} ETB Telegram Group Join Bonus credited to Play Wallet`;
+    }
+    
+    // Update player's tg_group_joined flag
+    const updatedFlags = {
+      tg_bonus_claimed: true,
+      tg_group_joined: shouldCreditTGGroupBonus
+    };
+
     const balances = await creditPlayerBalances(player_id, {
-      playAdd: 10,
-      type: 'telegram_group_bonus',
-      notes: '10 ETB Telegram Group Join Bonus credited to Play Wallet'
+      playAdd: playAdd,
+      type: shouldCreditTGGroupBonus ? 'telegram_group_bonus' : 'signup_complete',
+      notes: notes || 'Signup process completed'
     });
 
     const updatedPlayer = await savePlayer({
       ...player,
       ...balances,
-      tg_bonus_claimed: true
+      ...updatedFlags
     });
 
-    res.json({ success: true, user: sanitizePlayer(updatedPlayer) });
+    res.json({ 
+      success: true, 
+      user: sanitizePlayer(updatedPlayer),
+      bonus_credited: playAdd,
+      total_bonus: SIGNUP_BONUS + playAdd,
+      tg_group_joined: shouldCreditTGGroupBonus
+    });
   } catch (err) {
     console.error("Claim Telegram bonus error:", err.message);
     res.status(500).json({ error: err.message || "Failed to claim Telegram bonus" });
@@ -963,7 +999,7 @@ async function getRoundPot(game_id) {
 async function startNewRound() {
   currentActiveGameRoundId = generateRoundId();
   globalGameState = "waiting";
-  timeRemaining = INITIAL_WAIT_SECONDS; // 40 Seconds Loop Countdown!
+  timeRemaining = INITIAL_WAIT_SECONDS;
   currentRoundPot = 0;
   drawnBallsHistory = [];
   currentRoundWinners = [];
@@ -1175,6 +1211,9 @@ async function bootServer() {
   startNewRound();
   httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`⚡ Fast Bingo server running on port ${PORT}`);
+    console.log(`📱 Telegram Group Bonus: ${TG_GROUP_BONUS} ETB for joining group`);
+    console.log(`🎁 Signup Bonus: ${SIGNUP_BONUS} ETB base bonus`);
+    console.log(`💰 Total possible welcome bonus: ${SIGNUP_BONUS + TG_GROUP_BONUS} ETB`);
   });
 }
 

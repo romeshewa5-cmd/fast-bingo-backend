@@ -1,8 +1,9 @@
 require('dotenv').config();
-const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
@@ -15,21 +16,37 @@ const {
 } = require('./gameLogic');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(cors({
-  origin: true,
+  origin: '*',
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
   allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret", "X-Requested-With"]
 }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-const supabaseUrl = process.env.SUPABASE_URL || "https://rsmobdnuyxqyynxtjkyi.supabase.co";
-const supabaseKey = process.env.SUPABASE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.dummy-key-for-initialization";
-const supabase = createClient(supabaseUrl, supabaseKey);
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'dist')));
 
-// Economy and Timer Constants
+// ============ SUPABASE (only if REALLY configured) ============
+const supabaseUrl = process.env.SUPABASE_URL || "";
+const supabaseKey = process.env.SUPABASE_KEY || "";
+// FIX: the old code used a "dummy-key-for-initialization" fallback. That created a
+// client that silently failed on EVERY query, so nothing was ever persisted.
+const SUPABASE_ENABLED = !!(supabaseUrl && supabaseKey && !supabaseKey.includes('dummy'));
+
+let supabase = null;
+if (SUPABASE_ENABLED) {
+  try { supabase = createClient(supabaseUrl, supabaseKey); }
+  catch (e) { console.log("Supabase init error:", e.message); supabase = null; }
+}
+console.log("📦 Supabase:", supabase ? "ENABLED" : "DISABLED (using local file persistence)");
+
+// ============ CONSTANTS ============
+const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '';
+const ALLOW_UNVERIFIED_INITDATA = String(process.env.ALLOW_UNVERIFIED_INITDATA || 'false') === 'true';
 const CARD_PRICE = Number(process.env.CARD_PRICE) || 10;
 const PAYOUT_PERCENTAGE = Number(process.env.PAYOUT_PERCENTAGE) || 0.8;
 const MIN_PLAYERS_TO_START = Number(process.env.MIN_PLAYERS_TO_START) || 2;
@@ -37,933 +54,633 @@ const INITIAL_WAIT_SECONDS = Number(process.env.INITIAL_WAIT_SECONDS) || 40;
 const RECHECK_WAIT_SECONDS = Number(process.env.RECHECK_WAIT_SECONDS) || 40;
 const POST_ROUND_PAUSE_SECONDS = Number(process.env.POST_ROUND_PAUSE_SECONDS) || 15;
 const MIN_WITHDRAWAL_AMOUNT = Number(process.env.MIN_WITHDRAWAL_AMOUNT) || 100;
+const SIGNUP_BONUS = 10;
+const TG_GROUP_BONUS = 10;
 
-// Signup and Telegram Group Bonus amounts
-const SIGNUP_BONUS = 10; // Base signup bonus in ETB
-const TG_GROUP_BONUS = 10; // Extra bonus for joining Telegram group
+// ============ LOCAL PERSISTENCE (survives restarts) ============
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const PLAYERS_FILE = path.join(DATA_DIR, 'players.json');
+const PHONES_FILE = path.join(DATA_DIR, 'phones.json');
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 
-const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: { origin: "*", methods: ["GET", "POST"] }
-});
+const inMemoryPlayers = new Map();        // player_id -> player
+const inMemoryPhoneToId = new Map();      // phone -> player_id
+const inMemoryTgToId = new Map();         // telegram_id -> player_id
+const tgPhoneBook = new Map();            // telegram_id -> real phone shared with the bot
 
-// Memory fallbacks for players, coupons, deposit requests, and reference IDs if Supabase table or key is absent
-const inMemoryPlayers = new Map(); // player_id -> player
-const inMemoryPhoneToId = new Map(); // phone_number -> player_id
+function loadDisk() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(PLAYERS_FILE, 'utf8'));
+    (raw || []).forEach(p => {
+      inMemoryPlayers.set(p.player_id, p);
+      if (p.phone_number) inMemoryPhoneToId.set(String(p.phone_number), p.player_id);
+      if (p.telegram_id) inMemoryTgToId.set(String(p.telegram_id), p.player_id);
+    });
+    console.log(`💾 Loaded ${inMemoryPlayers.size} players from disk`);
+  } catch (e) {}
+  try {
+    const raw = JSON.parse(fs.readFileSync(PHONES_FILE, 'utf8'));
+    Object.entries(raw || {}).forEach(([k, v]) => tgPhoneBook.set(String(k), v));
+  } catch (e) {}
+}
+let flushTimer = null;
+function flushDisk() {
+  if (flushTimer) return;
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    try { fs.writeFileSync(PLAYERS_FILE, JSON.stringify(Array.from(inMemoryPlayers.values()))); } catch (e) {}
+    try { fs.writeFileSync(PHONES_FILE, JSON.stringify(Object.fromEntries(tgPhoneBook))); } catch (e) {}
+  }, 400);
+}
+loadDisk();
+
 const inMemoryDeposits = [];
 const inMemoryCoupons = [
-  { code: 'BINGO20', bonus_amount: 20, max_uses: 1000, used_count: 0, is_active: true, expiry_date: '2030-01-01' },
-  { code: 'FREEPLAY', bonus_amount: 10, max_uses: 500, used_count: 0, is_active: true, expiry_date: '2030-01-01' },
+  { code: 'BINGO20', bonus_amount: 20, max_uses: 1000, used_count: 0, is_active: true },
+  { code: 'FREEPLAY', bonus_amount: 10, max_uses: 500, used_count: 0, is_active: true },
 ];
-const couponRedemptions = new Set(); // format: "player_id:coupon_code"
+const couponRedemptions = new Set();
 const submittedReferenceIds = new Set();
 
-// Helper to sanitize player balances
+// Round participants kept in memory so the game works WITHOUT supabase.
+// gameId -> Map(player_id -> { purchased_cards, cards, username })
+const roundParticipants = new Map();
+function participantsOf(gameId) {
+  if (!roundParticipants.has(gameId)) roundParticipants.set(gameId, new Map());
+  return roundParticipants.get(gameId);
+}
+
+// ============ TELEGRAM initData VALIDATION ============
+function parseInitData(initData) {
+  const params = new URLSearchParams(initData || '');
+  const obj = {};
+  for (const [k, v] of params.entries()) obj[k] = v;
+  return obj;
+}
+function verifyInitData(initData) {
+  if (!initData) return null;
+  const data = parseInitData(initData);
+  const hash = data.hash;
+  if (!hash) return null;
+
+  if (BOT_TOKEN) {
+    const checkString = Object.keys(data)
+      .filter(k => k !== 'hash' && k !== 'signature')
+      .sort()
+      .map(k => `${k}=${data[k]}`)
+      .join('\n');
+    const secret = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+    const calc = crypto.createHmac('sha256', secret).update(checkString).digest('hex');
+    if (calc !== hash && !ALLOW_UNVERIFIED_INITDATA) return null;
+  } else if (!ALLOW_UNVERIFIED_INITDATA) {
+    console.warn("⚠️ BOT_TOKEN not set - cannot verify initData");
+    return null;
+  }
+
+  try {
+    const user = JSON.parse(data.user || '{}');
+    if (!user.id) return null;
+    return { user, start_param: data.start_param || '' };
+  } catch (e) { return null; }
+}
+
 function sanitizePlayer(p) {
   if (!p) return null;
   const main = Number(p.main_balance ?? p.balance ?? 0);
   const play = Number(p.play_balance ?? 0);
-  const total = main + play;
-  const refCount = Number(p.referrals_count ?? p.referral_count ?? 0);
-  const refEarned = Number(p.referral_earnings ?? (refCount * 5) ?? 0);
   return {
     ...p,
     main_balance: main,
     play_balance: play,
-    balance: total,
-    referrals_count: refCount,
-    referral_earnings: refEarned,
+    balance: main + play,
+    referrals_count: Number(p.referrals_count ?? 0),
+    referral_earnings: Number(p.referral_earnings ?? 0),
   };
 }
 
-// Safe Player Lookup by Phone
-async function findPlayerByPhone(phone_number) {
-  try {
-    const { data, error } = await supabase
-      .from('players')
-      .select('*')
-      .eq('phone_number', phone_number)
-      .maybeSingle();
-    if (!error && data) {
-      inMemoryPlayers.set(data.player_id, data);
-      inMemoryPhoneToId.set(data.phone_number, data.player_id);
-      return data;
-    }
-  } catch (err) {
-    console.warn("Supabase lookup failed for phone:", err.message);
+async function findPlayerByTelegramId(telegram_id) {
+  if (!telegram_id) return null;
+  const tid = String(telegram_id);
+  if (supabase) {
+    try {
+      const { data } = await supabase.from('players').select('*').eq('telegram_id', tid).maybeSingle();
+      if (data) { cachePlayer(data); return data; }
+    } catch (e) {}
   }
-  const pId = inMemoryPhoneToId.get(phone_number);
-  if (pId && inMemoryPlayers.has(pId)) {
-    return inMemoryPlayers.get(pId);
-  }
-  return null;
+  const pid = inMemoryTgToId.get(tid);
+  return pid ? inMemoryPlayers.get(pid) || null : null;
 }
-
-// Safe Player Lookup by ID
+async function findPlayerByPhone(phone_number) {
+  if (!phone_number) return null;
+  if (supabase) {
+    try {
+      const { data } = await supabase.from('players').select('*').eq('phone_number', phone_number).maybeSingle();
+      if (data) { cachePlayer(data); return data; }
+    } catch (e) {}
+  }
+  const pId = inMemoryPhoneToId.get(String(phone_number));
+  return pId ? inMemoryPlayers.get(pId) || null : null;
+}
 async function findPlayerById(player_id) {
-  try {
-    const { data, error } = await supabase
-      .from('players')
-      .select('*')
-      .eq('player_id', player_id)
-      .maybeSingle();
-    if (!error && data) {
-      inMemoryPlayers.set(data.player_id, data);
-      if (data.phone_number) inMemoryPhoneToId.set(data.phone_number, data.player_id);
-      return data;
-    }
-  } catch (err) {
-    console.warn("Supabase lookup failed for id:", err.message);
+  if (!player_id) return null;
+  if (supabase) {
+    try {
+      const { data } = await supabase.from('players').select('*').eq('player_id', player_id).maybeSingle();
+      if (data) { cachePlayer(data); return data; }
+    } catch (e) {}
   }
   return inMemoryPlayers.get(player_id) || null;
 }
-
-// Safe Player Save/Upsert
+function cachePlayer(p) {
+  if (!p || !p.player_id) return;
+  inMemoryPlayers.set(p.player_id, p);
+  if (p.phone_number) inMemoryPhoneToId.set(String(p.phone_number), p.player_id);
+  if (p.telegram_id) inMemoryTgToId.set(String(p.telegram_id), p.player_id);
+  flushDisk();
+}
 async function savePlayer(playerObj) {
   if (!playerObj || !playerObj.player_id) return playerObj;
-  inMemoryPlayers.set(playerObj.player_id, playerObj);
-  if (playerObj.phone_number) {
-    inMemoryPhoneToId.set(playerObj.phone_number, playerObj.player_id);
-  }
+  cachePlayer(playerObj);
+  if (!supabase) return playerObj;
   try {
-    const { data, error } = await supabase
-      .from('players')
-      .upsert([playerObj], { onConflict: 'player_id' })
-      .select()
-      .maybeSingle();
-    if (!error && data) {
-      inMemoryPlayers.set(data.player_id, data);
-      return data;
-    }
-  } catch (err) {
-    console.warn("Supabase upsert failed:", err.message);
-  }
+    const { data } = await supabase.from('players').upsert([playerObj], { onConflict: 'player_id' }).select().maybeSingle();
+    if (data) cachePlayer(data);
+    return data || playerObj;
+  } catch (err) {}
   return playerObj;
 }
 
-// Transaction Logging
-async function logTransaction({ player_id, type, amount, game_id = null, balance_after = null, notes = null }) {
+async function logTransaction({ player_id, type, amount, game_id, balance_after, notes }) {
+  if (!supabase) return;
   try {
-    await supabase.from('transactions').insert([{
-      player_id, type, amount, game_id, balance_after, notes,
-    }]);
-  } catch (err) {
-    console.error("Ledger transaction log failed:", err.message, { player_id, type, amount });
-  }
+    await supabase.from('transactions').insert([{ player_id, type, amount, game_id, balance_after, notes }]);
+  } catch (err) {}
 }
 
-// Balance helper with Dual Wallet support
-async function creditPlayerBalances(player_id, { mainAdd = 0, playAdd = 0, type, game_id = null, notes = null }) {
+async function creditPlayerBalances(player_id, { mainAdd = 0, playAdd = 0, type, game_id, notes }) {
   let player = await findPlayerById(player_id);
-  if (!player) {
-    player = {
-      player_id,
-      username: `Player_${player_id.slice(-4)}`,
-      phone_number: '0900000000',
-      main_balance: 0,
-      play_balance: 0,
-      balance: 0
-    };
-  }
-
+  if (!player) return null; // FIX: never silently invent a player
   const curMain = Number(player.main_balance ?? player.balance ?? 0);
   const curPlay = Number(player.play_balance ?? 0);
-
   const newMain = Math.max(0, curMain + mainAdd);
   const newPlay = Math.max(0, curPlay + playAdd);
-  const newTotal = newMain + newPlay;
-
-  const updatedPlayer = {
-    ...player,
-    main_balance: newMain,
-    play_balance: newPlay,
-    balance: newTotal
-  };
-
-  const saved = await savePlayer(updatedPlayer);
-
-  const netAmount = mainAdd + playAdd;
-  await logTransaction({ player_id, type, amount: netAmount, game_id, balance_after: newTotal, notes });
-  return { main_balance: newMain, play_balance: newPlay, balance: newTotal };
+  const updated = { ...player, main_balance: newMain, play_balance: newPlay, balance: newMain + newPlay };
+  await savePlayer(updated);
+  await logTransaction({ player_id, type, amount: mainAdd + playAdd, game_id, balance_after: updated.balance, notes });
+  return { main_balance: newMain, play_balance: newPlay, balance: newMain + newPlay };
 }
 
-// Admin Auth Middleware
 function requireAdmin(req, res, next) {
-  const expected = process.env.ADMIN_SECRET || '';
-  if (!expected) {
-    // Accept default dev secret if ADMIN_SECRET not set
-    const provided = String(req.headers['x-admin-secret'] || '');
-    if (provided === 'admin' || provided === '123456' || provided === 'fastbingo') return next();
-  }
-  const provided = String(req.headers['x-admin-secret'] || '');
-  if (expected && provided !== expected) {
-    return res.status(401).json({ error: "Unauthorized admin access." });
-  }
-  next();
+  const secret = process.env.ADMIN_SECRET || '';
+  const provided = req.headers['x-admin-secret'] || '';
+  if (secret ? provided === secret : ['admin', '123456', 'fastbingo'].includes(provided)) return next();
+  res.status(401).json({ error: "Unauthorized" });
 }
 
-// --- API ROUTES ---
+// ============================================================
+//                        API ROUTES
+// ============================================================
 
-app.get('/admin', (req, res) => {
-  res.sendFile(path.join(__dirname, 'admin.html'));
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    gameId: currentActiveGameRoundId,
+    state: globalGameState,
+    timeRemaining,
+    participants: participantsOf(currentActiveGameRoundId).size,
+    players: inMemoryPlayers.size,
+    supabase: !!supabase
+  });
 });
+app.get('/api/health-check', (req, res) => res.json({ status: 'online', timestamp: new Date().toISOString() }));
 
-app.get('/api/health-check', async (req, res) => {
+/**
+ * MAIN AUTH ENDPOINT.
+ * The webapp sends Telegram.WebApp.initData. We verify the HMAC, take the REAL
+ * telegram id / username from it, and look the player up BY TELEGRAM ID.
+ * -> Re-opening the webapp always returns the same account (no more re-register).
+ * -> Username is always the real Telegram username.
+ * -> Phone comes from the bot's contact-share (phonebook), never invented.
+ */
+app.post('/api/auth/telegram', async (req, res) => {
   try {
-    const { error } = await supabase.from('players').select('count', { count: 'exact', head: true });
-    if (error) throw error;
-    res.json({ status: "online", database: "connected" });
-  } catch (err) {
-    res.json({ status: "online", database: "in_memory_mode", note: "Running with in-memory persistence" });
-  }
-});
+    const { initData, referrer_id } = req.body || {};
+    const verified = verifyInitData(initData);
+    if (!verified) return res.status(401).json({ error: 'invalid_init_data' });
 
-// Registration with 10 Birr Signup Bonus to Play Wallet
-app.post('/api/register', async (req, res) => {
-  const { username, phone_number, referrer_id, telegram_id } = req.body;
-  if (!username || !phone_number) {
-    return res.status(400).json({ error: "Username and Phone Number are required." });
-  }
-  try {
-    let player = await findPlayerByPhone(phone_number);
+    const tgUser = verified.user;
+    const telegram_id = String(tgUser.id);
+    const username = tgUser.username
+      || [tgUser.first_name, tgUser.last_name].filter(Boolean).join(' ')
+      || `tg_${telegram_id}`;
+    const knownPhone = tgPhoneBook.get(telegram_id) || null;
+
+    let player = await findPlayerByTelegramId(telegram_id);
 
     if (player) {
-      // Existing user - return their data
-      return res.json({ isNew: false, user: sanitizePlayer(player) });
-    } else {
-      // New User Registration: 10 Birr Base Signup Bonus to Play Wallet!
-      const generatedId = `p_${Date.now()}_${Math.floor(Math.random()*10000)}`;
-      const newPlayerObj = {
-        player_id: generatedId,
-        username,
-        phone_number,
-        telegram_id: telegram_id || null, // Store Telegram ID
-        main_balance: 0,
-        play_balance: SIGNUP_BONUS, // 10 Birr Base Bonus!
-        balance: SIGNUP_BONUS,
-        referred_by: referrer_id || null,
-        referrals_count: 0,
-        referral_earnings: 0,
-        tg_bonus_claimed: false, // Will be updated when they claim TG group bonus
-        tg_group_joined: false,
-        created_at: new Date().toISOString()
-      };
-
-      const savedPlayer = await savePlayer(newPlayerObj);
-
-      await logTransaction({
-        player_id: savedPlayer.player_id,
-        type: 'signup_bonus',
-        amount: SIGNUP_BONUS,
-        balance_after: SIGNUP_BONUS,
-        notes: `${SIGNUP_BONUS} Birr Registration Bonus credited to Play Wallet`
-      });
-
-      // Handle Referrer Reward if referrer_id exists
-      if (referrer_id && String(referrer_id).trim()) {
-        const cleanRefId = String(referrer_id).trim();
-        try {
-          const refPlayer = await findPlayerById(cleanRefId);
-
-          if (refPlayer && refPlayer.player_id !== savedPlayer.player_id) {
-            const currentRefCount = Number(refPlayer.referrals_count ?? refPlayer.referral_count ?? 0) + 1;
-            const currentRefEarn = Number(refPlayer.referral_earnings ?? 0) + 5;
-
-            // Give +5 ETB to referrer Play Wallet
-            await creditPlayerBalances(refPlayer.player_id, {
-              playAdd: 5,
-              type: 'referral_bonus',
-              notes: `5 ETB referral reward for inviting ${username}`
-            });
-
-            // Update referrer stats
-            await savePlayer({
-              ...refPlayer,
-              referrals_count: currentRefCount,
-              referral_earnings: currentRefEarn
-            });
-
-            // Milestone bonus: 100 ETB for reaching 10 referrals (or multiples of 10)
-            if (currentRefCount % 10 === 0) {
-              await creditPlayerBalances(refPlayer.player_id, {
-                playAdd: 100,
-                type: 'referral_milestone_bonus',
-                notes: `🎉 100 ETB Milestone bonus for inviting ${currentRefCount} players!`
-              });
-            }
-          }
-        } catch (refErr) {
-          console.error("Referral processing error:", refErr.message);
-        }
-      }
-
-      return res.json({ isNew: true, user: sanitizePlayer(savedPlayer) });
-    }
-  } catch (err) {
-    console.error("Register endpoint error:", err.message);
-    res.status(500).json({ error: err.message || "Registration failed" });
-  }
-});
-
-// Endpoint to claim Telegram Group Join Bonus (+10 ETB extra if they joined)
-app.post('/api/claim-telegram-bonus', async (req, res) => {
-  const { player_id, claimed_tg_group } = req.body;
-  
-  if (!player_id) {
-    return res.status(400).json({ error: "Player ID is required." });
-  }
-  
-  // claimed_tg_group: true = user clicked the group link AND verified → get +10 ETB extra
-  // claimed_tg_group: false = user skipped → no extra bonus
-  const shouldCreditTGGroupBonus = claimed_tg_group === true;
-  
-  try {
-    const player = await findPlayerById(player_id);
-
-    if (!player) {
-      return res.status(404).json({ error: "Player not found." });
-    }
-
-    // Check if already claimed
-    if (player.tg_bonus_claimed) {
-      return res.json({ success: true, claimed: true, user: sanitizePlayer(player), message: "Bonus already claimed" });
-    }
-
-    // Credit bonuses to play_balance
-    // Base signup bonus (10 ETB) is already credited during registration
-    // If user joined TG group, credit the extra 10 ETB
-    let playAdd = 0;
-    let notes = '';
-    
-    if (shouldCreditTGGroupBonus) {
-      playAdd = TG_GROUP_BONUS; // +10 ETB for joining TG group
-      notes = `${TG_GROUP_BONUS} ETB Telegram Group Join Bonus credited to Play Wallet`;
-    }
-    
-    // Update player's tg_group_joined flag
-    const updatedFlags = {
-      tg_bonus_claimed: true,
-      tg_group_joined: shouldCreditTGGroupBonus
-    };
-
-    const balances = await creditPlayerBalances(player_id, {
-      playAdd: playAdd,
-      type: shouldCreditTGGroupBonus ? 'telegram_group_bonus' : 'signup_complete',
-      notes: notes || 'Signup process completed'
-    });
-
-    const updatedPlayer = await savePlayer({
-      ...player,
-      ...balances,
-      ...updatedFlags
-    });
-
-    res.json({ 
-      success: true, 
-      user: sanitizePlayer(updatedPlayer),
-      bonus_credited: playAdd,
-      total_bonus: SIGNUP_BONUS + playAdd,
-      tg_group_joined: shouldCreditTGGroupBonus
-    });
-  } catch (err) {
-    console.error("Claim Telegram bonus error:", err.message);
-    res.status(500).json({ error: err.message || "Failed to claim Telegram bonus" });
-  }
-});
-
-// Check Active Game Re-entry Status with Defensive Metadata Schema Fallback
-app.get('/api/games/check-active/:player_id/:game_id', async (req, res) => {
-  try {
-    const { player_id, game_id } = req.params;
-
-    let data = null;
-    try {
-      const { data: resData, error } = await supabase
-        .from('game_participants')
-        .select('*')
-        .eq('player_id', player_id)
-        .eq('game_id', game_id)
-        .maybeSingle();
-      if (error && error.code !== 'PGRST116') throw error;
-      data = resData;
-    } catch (err) {
-      // Fallback if metadata column query fails
-      data = null;
-    }
-
-    if (data) {
-      let cardsList = [117];
-      if (data.metadata && data.metadata.cards) {
-        cardsList = data.metadata.cards;
-      } else if (data.purchased_cards === 2) {
-        cardsList = [117, 118];
-      }
+      const patch = { ...player, username };
+      if (knownPhone && player.phone_number !== knownPhone) patch.phone_number = knownPhone;
+      player = await savePlayer(patch);
       return res.json({
-        registered: true,
-        cards_bought: data.purchased_cards || 1,
-        is_winner: !!data.is_winner,
-        cards_list: cardsList
+        isNew: false,
+        needs_phone: !patch.phone_number,
+        user: sanitizePlayer(player)
       });
-    } else {
-      return res.json({ registered: false });
     }
+
+    if (!knownPhone) {
+      // Not registered yet and the bot has no phone for this user.
+      return res.json({ isNew: true, needs_phone: true, telegram_id, username, user: null });
+    }
+
+    player = await createPlayer({ username, phone_number: knownPhone, telegram_id, referrer_id: referrer_id || verified.start_param });
+    res.json({ isNew: true, needs_phone: false, user: sanitizePlayer(player) });
+  } catch (err) {
+    console.error("❌ auth error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Poll this while the user is sharing the contact with the bot
+app.post('/api/auth/phone-status', async (req, res) => {
+  const verified = verifyInitData((req.body || {}).initData);
+  if (!verified) return res.status(401).json({ error: 'invalid_init_data' });
+  const tid = String(verified.user.id);
+  const phone = tgPhoneBook.get(tid) || null;
+  if (!phone) return res.json({ has_phone: false });
+
+  let player = await findPlayerByTelegramId(tid);
+  if (!player) {
+    const username = verified.user.username
+      || [verified.user.first_name, verified.user.last_name].filter(Boolean).join(' ')
+      || `tg_${tid}`;
+    player = await createPlayer({
+      username, phone_number: phone, telegram_id: tid,
+      referrer_id: (req.body || {}).referrer_id || verified.start_param
+    });
+    return res.json({ has_phone: true, isNew: true, user: sanitizePlayer(player) });
+  }
+  if (!player.phone_number) player = await savePlayer({ ...player, phone_number: phone });
+  res.json({ has_phone: true, isNew: false, user: sanitizePlayer(player) });
+});
+
+async function createPlayer({ username, phone_number, telegram_id, referrer_id }) {
+  const existingByPhone = await findPlayerByPhone(phone_number);
+  if (existingByPhone) {
+    return await savePlayer({ ...existingByPhone, telegram_id: telegram_id || existingByPhone.telegram_id, username });
+  }
+  const playerId = `p_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+  const newPlayer = {
+    player_id: playerId,
+    username,
+    phone_number,
+    telegram_id: telegram_id ? String(telegram_id) : null,
+    main_balance: 0,
+    play_balance: SIGNUP_BONUS,
+    balance: SIGNUP_BONUS,
+    referred_by: referrer_id || null,
+    referrals_count: 0,
+    referral_earnings: 0,
+    tg_bonus_claimed: false,
+    tg_group_joined: false,
+    created_at: new Date().toISOString()
+  };
+  const saved = await savePlayer(newPlayer);
+  await logTransaction({ player_id: saved.player_id, type: 'signup_bonus', amount: SIGNUP_BONUS, balance_after: SIGNUP_BONUS, notes: 'Signup bonus' });
+  console.log("✅ New player:", saved.player_id, username, phone_number);
+  return saved;
+}
+
+/**
+ * Telegram BOT WEBHOOK.
+ * Point your bot webhook here: https://<your-domain>/api/telegram/webhook
+ * When the user taps the "Share phone number" keyboard button, Telegram sends a
+ * message with `contact` -> that's the ONLY reliable way to get a real phone.
+ */
+app.post('/api/telegram/webhook', async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const msg = req.body?.message;
+    if (!msg) return;
+    const from = msg.from || {};
+    const tid = String(from.id);
+
+    if (msg.contact && String(msg.contact.user_id) === tid) {
+      let phone = String(msg.contact.phone_number || '').replace(/\s/g, '');
+      if (phone && !phone.startsWith('+')) phone = '+' + phone;
+      tgPhoneBook.set(tid, phone);
+      flushDisk();
+      console.log("📞 Contact stored for", tid, phone);
+
+      const username = from.username || [from.first_name, from.last_name].filter(Boolean).join(' ') || `tg_${tid}`;
+      let player = await findPlayerByTelegramId(tid);
+      if (!player) await createPlayer({ username, phone_number: phone, telegram_id: tid });
+      else if (!player.phone_number) await savePlayer({ ...player, phone_number: phone });
+
+      await tgSend(msg.chat.id, "✅ Phone verified! Open the app and start playing.", {
+        remove_keyboard: true
+      });
+    } else if (msg.text && msg.text.startsWith('/start')) {
+      if (tgPhoneBook.has(tid)) {
+        await tgSend(msg.chat.id, "🎮 You're verified. Tap the menu button to play Fast Bingo!");
+      } else {
+        await tgSend(msg.chat.id, "👋 Welcome to Fast Bingo!\nShare your phone number to create your account.", {
+          keyboard: [[{ text: "📱 Share my phone number", request_contact: true }]],
+          resize_keyboard: true,
+          one_time_keyboard: true
+        });
+      }
+    }
+  } catch (e) { console.error("webhook error", e.message); }
+});
+
+async function tgSend(chat_id, text, reply_markup) {
+  if (!BOT_TOKEN) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id, text, reply_markup })
+    });
+  } catch (e) {}
+}
+
+// Legacy register endpoint (kept for compatibility, now telegram-id aware)
+app.post('/api/register', async (req, res) => {
+  const { username, phone_number, referrer_id, telegram_id } = req.body;
+  if (!username || !phone_number) return res.status(400).json({ error: "Username and phone required" });
+  try {
+    let player = telegram_id ? await findPlayerByTelegramId(telegram_id) : null;
+    if (!player) player = await findPlayerByPhone(phone_number);
+    if (player) return res.json({ isNew: false, user: sanitizePlayer(player) });
+    const created = await createPlayer({ username, phone_number, telegram_id, referrer_id });
+    res.json({ isNew: true, user: sanitizePlayer(created) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Fetch Single Player Profile
+app.post('/api/claim-telegram-bonus', async (req, res) => {
+  const { player_id, claimed_tg_group } = req.body;
+  if (!player_id) return res.status(400).json({ error: "Player ID required" });
+  try {
+    const player = await findPlayerById(player_id);
+    if (!player) return res.status(404).json({ error: "Player not found" });
+    if (player.tg_bonus_claimed) return res.json({ success: true, claimed: true, user: sanitizePlayer(player) });
+
+    const bonusAmount = claimed_tg_group === true ? TG_GROUP_BONUS : 0;
+    const balances = await creditPlayerBalances(player_id, {
+      playAdd: bonusAmount,
+      type: claimed_tg_group ? 'telegram_group_bonus' : 'signup_complete',
+      notes: claimed_tg_group ? 'TG Group bonus' : 'Signup complete'
+    }) || {};
+    const updated = await savePlayer({ ...player, ...balances, tg_bonus_claimed: true, tg_group_joined: claimed_tg_group === true });
+    res.json({ success: true, user: sanitizePlayer(updated), bonus_credited: bonusAmount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/player/:id', async (req, res) => {
   try {
     const player = await findPlayerById(req.params.id);
     if (!player) return res.status(404).json({ error: "Player not found" });
-
     res.json(sanitizePlayer(player));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Taken Cards Query with Schema Safeguard
-app.get('/api/games/taken-cards/:game_id', async (req, res) => {
-  try {
-    const taken = new Set();
+app.get('/api/games/check-active/:player_id/:game_id', async (req, res) => {
+  const { player_id, game_id } = req.params;
+  const p = participantsOf(game_id).get(player_id);
+  if (p) return res.json({ registered: true, cards_bought: p.purchased_cards, cards_list: p.cards });
+  if (supabase) {
     try {
-      const { data, error } = await supabase
-        .from('game_participants')
-        .select('*')
-        .eq('game_id', req.params.game_id);
-      if (!error && data) {
-        data.forEach(row => {
-          const cards = (row.metadata && row.metadata.cards) || [];
-          cards.forEach(c => taken.add(Number(c)));
-        });
+      const { data } = await supabase.from('game_participants').select('*').eq('player_id', player_id).eq('game_id', game_id).maybeSingle();
+      if (data) {
+        const cards = data.metadata?.cards || [];
+        return res.json({ registered: true, cards_bought: data.purchased_cards || 1, cards_list: cards });
       }
-    } catch (e) {
-      // Safe fallback
-    }
-    res.json({ taken: Array.from(taken) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    } catch (e) {}
   }
+  res.json({ registered: false });
 });
 
-// Game Join & Entry Fee Deduction (Deducts Play Wallet first, then Main Wallet)
+app.get('/api/games/taken-cards/:game_id', async (req, res) => {
+  const taken = new Set();
+  participantsOf(req.params.game_id).forEach(p => (p.cards || []).forEach(c => taken.add(Number(c))));
+  if (supabase) {
+    try {
+      const { data } = await supabase.from('game_participants').select('*').eq('game_id', req.params.game_id);
+      if (data) data.forEach(r => (r.metadata?.cards || []).forEach(c => taken.add(Number(c))));
+    } catch (e) {}
+  }
+  res.json({ taken: Array.from(taken) });
+});
+
 app.post('/api/games/create', async (req, res) => {
   const { player_id, game_id, cards_bought, cards_list } = req.body;
+  console.log("🎮 Game create:", player_id, game_id, cards_bought);
+
   if (!player_id || !game_id || !cards_bought) {
-    return res.status(400).json({ success: false, error: "Missing required fields." });
+    return res.status(400).json({ success: false, error: "missing_fields" });
   }
-
-  const numCards = Number(cards_bought);
-  if (!Number.isInteger(numCards) || numCards < 1 || numCards > 2) {
-    return res.status(400).json({ success: false, error: "Invalid cards_bought." });
-  }
-  const requestedCards = Array.from(new Set((cards_list && cards_list.length ? cards_list : [117]).map(Number)));
-  const cost = CARD_PRICE * numCards;
-
   try {
-    if (game_id === currentActiveGameRoundId && globalGameState !== "waiting") {
+    if (game_id !== currentActiveGameRoundId) {
+      return res.status(400).json({ success: false, error: "round_expired", game_id: currentActiveGameRoundId });
+    }
+    if (globalGameState !== "waiting") {
       return res.status(400).json({ success: false, error: "round_not_open" });
     }
 
-    const playerRow = await findPlayerById(player_id);
-    if (!playerRow) return res.status(404).json({ success: false, error: "Player not found." });
+    const player = await findPlayerById(player_id);
+    if (!player) return res.status(404).json({ success: false, error: "player_not_found" });
+    if (player.is_banned) return res.status(403).json({ success: false, error: "banned" });
 
-    if (playerRow.is_banned) {
-      return res.status(403).json({ success: false, error: "banned" });
+    const parts = participantsOf(game_id);
+    if (parts.has(player_id)) return res.status(400).json({ success: false, error: "already_registered" });
+
+    const wanted = (cards_list && cards_list.length ? cards_list : [117]).map(Number);
+    const taken = new Set();
+    parts.forEach(p => (p.cards || []).forEach(c => taken.add(Number(c))));
+    if (wanted.some(c => taken.has(c))) {
+      return res.status(400).json({ success: false, error: "card_taken" });
     }
 
-    const player = sanitizePlayer(playerRow);
-    if (player.balance < cost) {
-      return res.status(400).json({ success: false, error: "insufficient_balance" });
+    const sp = sanitizePlayer(player);
+    const cost = CARD_PRICE * Number(cards_bought);
+    if (sp.balance < cost) return res.status(400).json({ success: false, error: "insufficient_balance" });
+
+    const deductPlay = Math.min(sp.play_balance, cost);
+    const deductMain = cost - deductPlay;
+    const balances = await creditPlayerBalances(player_id, {
+      mainAdd: -deductMain, playAdd: -deductPlay,
+      type: 'entry_fee', game_id, notes: `${cards_bought} cards`
+    });
+    if (!balances) return res.status(404).json({ success: false, error: "player_not_found" });
+
+    parts.set(player_id, {
+      purchased_cards: Number(cards_bought),
+      cards: wanted,
+      username: player.username || 'Player'
+    });
+
+    if (supabase) {
+      try {
+        await supabase.from('game_participants').insert([{
+          player_id, game_id, purchased_cards: Number(cards_bought), is_winner: false, metadata: { cards: wanted }
+        }]);
+      } catch (e) {}
     }
 
-    // Check existing registration
-    try {
-      const { data: existing } = await supabase
-        .from('game_participants')
-        .select('player_id')
-        .eq('player_id', player_id)
-        .eq('game_id', game_id)
-        .maybeSingle();
-      if (existing) {
-        return res.status(400).json({ success: false, error: "already_registered" });
-      }
-    } catch (e) {}
-
-    // Deduct cost: Play Wallet first, then Main Wallet
-    let deductPlay = Math.min(player.play_balance, cost);
-    let deductMain = cost - deductPlay;
-
-    let newPlay = player.play_balance - deductPlay;
-    let newMain = player.main_balance - deductMain;
-    let newTotal = newMain + newPlay;
-
-    // Update Player Balances
-    await savePlayer({
-      ...playerRow,
-      main_balance: newMain,
-      play_balance: newPlay,
-      balance: newTotal
-    });
-
-    // Insert Participant Record with Safe Schema Fallback
-    let participantData = null;
-    try {
-      const { data, error } = await supabase
-        .from('game_participants')
-        .insert([{
-          player_id,
-          game_id,
-          purchased_cards: numCards,
-          is_winner: false,
-          metadata: { cards: requestedCards }
-        }])
-        .select()
-        .single();
-      if (error && (error.message.includes('metadata') || error.code === 'PGRST204')) {
-        throw error; // trigger catch fallback
-      }
-      participantData = data;
-    } catch (pErr) {
-      // Schema fallback without metadata column
-      const { data: fbData, error: fbErr } = await supabase
-        .from('game_participants')
-        .insert([{
-          player_id,
-          game_id,
-          purchased_cards: numCards,
-          is_winner: false
-        }])
-        .select()
-        .single();
-      if (fbErr) {
-        // Rollback balance update
-        await supabase.from('players').update({ balance: player.balance }).eq('player_id', player_id);
-        throw fbErr;
-      }
-      participantData = fbData;
-    }
-
-    await logTransaction({
-      player_id,
-      type: 'entry_fee',
-      amount: -cost,
-      game_id,
-      balance_after: newTotal,
-      notes: `${numCards} card(s) entry fee (${deductPlay} ETB Play Wallet, ${deductMain} ETB Main Wallet)`
-    });
-
-    res.json({
-      success: true,
-      participant: participantData,
-      main_balance: newMain,
-      play_balance: newPlay,
-      balance: newTotal
-    });
+    broadcastTick();
+    console.log(`✅ Joined round ${game_id}: ${parts.size} participant(s)`);
+    res.json({ success: true, ...balances });
   } catch (err) {
-    console.error("games/create failed:", err.message);
+    console.error("❌ Game create error:", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Player History
 app.get('/api/history/:player_id', async (req, res) => {
+  if (!supabase) return res.json([]);
   try {
-    const { player_id } = req.params;
-    if (!player_id || player_id === 'undefined' || player_id === 'null') {
-      return res.status(200).json([]);
-    }
-    const { data, error } = await supabase
-      .from('game_participants')
-      .select('game_id, purchased_cards, is_winner')
-      .eq('player_id', player_id);
-
-    if (error) throw error;
-    return res.status(200).json(data || []);
-  } catch (catchErr) {
-    return res.status(200).json([]);
-  }
-});
-
-// Leaderboard
-app.get('/api/leaderboard', async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('players')
-      .select('username, balance')
-      .order('balance', { ascending: false })
-      .limit(10);
-    if (error) throw error;
+    const { data } = await supabase.from('game_participants').select('game_id, purchased_cards, is_winner').eq('player_id', req.params.player_id);
     res.json(data || []);
-  } catch (err) {
-    res.status(200).json([]);
-  }
+  } catch (err) { res.json([]); }
 });
 
-// Deposit Request Endpoint (with Duplicate Reference Safeguard)
+app.get('/api/leaderboard', async (req, res) => {
+  if (supabase) {
+    try {
+      const { data } = await supabase.from('players').select('username, balance').order('balance', { ascending: false }).limit(10);
+      if (data) return res.json(data);
+    } catch (err) {}
+  }
+  const list = Array.from(inMemoryPlayers.values()).map(sanitizePlayer)
+    .sort((a, b) => b.balance - a.balance).slice(0, 10)
+    .map(p => ({ username: p.username, balance: p.balance }));
+  res.json(list);
+});
+
 app.post('/api/wallet/deposit-request', async (req, res) => {
   const { player_id, method, amount, reference_id } = req.body;
-  const amt = Number(amount);
-  if (!player_id || !amt || amt <= 0 || !reference_id || !method) {
-    return res.status(400).json({ success: false, error: "Missing required deposit details." });
-  }
-
-  const cleanRef = String(reference_id).trim().toUpperCase();
-  const isDuplicate = submittedReferenceIds.has(cleanRef);
+  if (!player_id || !amount || !reference_id) return res.status(400).json({ success: false, error: "Missing fields" });
+  const cleanRef = String(reference_id).toUpperCase();
+  if (submittedReferenceIds.has(cleanRef)) return res.status(400).json({ success: false, error: "duplicate_reference" });
   submittedReferenceIds.add(cleanRef);
-
-  const depositRecord = {
-    id: Date.now(),
-    player_id,
-    method,
-    amount: amt,
-    reference_id: cleanRef,
-    is_duplicate: isDuplicate,
-    status: 'pending',
-    requested_at: new Date().toISOString()
-  };
-
-  try {
-    const { data, error } = await supabase
-      .from('deposit_requests')
-      .insert([depositRecord])
-      .select().single();
-    if (error) throw error;
-    res.json({ success: true, request: data, is_duplicate: isDuplicate });
-  } catch (err) {
-    // Memory fallback if DB table not present
-    inMemoryDeposits.unshift(depositRecord);
-    res.json({ success: true, request: depositRecord, is_duplicate: isDuplicate });
-  }
+  const record = { id: Date.now(), player_id, method: method || 'Telebirr', amount: Number(amount), reference_id: cleanRef, status: 'pending', requested_at: new Date().toISOString() };
+  inMemoryDeposits.push(record);
+  if (supabase) { try { await supabase.from('deposit_requests').insert([record]); } catch (e) {} }
+  res.json({ success: true, request: record });
 });
 
-// Redeem Coupon Endpoint
 app.post('/api/wallet/redeem-coupon', async (req, res) => {
   const { player_id, coupon_code } = req.body;
-  if (!player_id || !coupon_code) {
-    return res.status(400).json({ success: false, error: "Player ID and Coupon Code are required." });
-  }
-
-  const code = String(coupon_code).trim().toUpperCase();
+  if (!player_id || !coupon_code) return res.status(400).json({ success: false, error: "Missing fields" });
+  const code = String(coupon_code).toUpperCase();
   const key = `${player_id}:${code}`;
-
-  if (couponRedemptions.has(key)) {
-    return res.status(400).json({ success: false, error: "You have already redeemed this coupon code." });
-  }
-
-  // Find coupon
-  let coupon = inMemoryCoupons.find(c => c.code === code && c.is_active);
-  if (!coupon) {
-    try {
-      const { data } = await supabase.from('coupons').select('*').eq('code', code).eq('is_active', true).single();
-      coupon = data;
-    } catch (e) {}
-  }
-
-  if (!coupon) {
-    return res.status(404).json({ success: false, error: "Invalid or expired coupon code." });
-  }
-
-  if (coupon.used_count >= coupon.max_uses) {
-    return res.status(400).json({ success: false, error: "Coupon usage limit reached." });
-  }
-
-  // Record redemption and credit Play Wallet
+  if (couponRedemptions.has(key)) return res.status(400).json({ success: false, error: "Already redeemed" });
+  const coupon = inMemoryCoupons.find(c => c.code === code && c.is_active);
+  if (!coupon) return res.status(404).json({ success: false, error: "Invalid coupon" });
+  const balances = await creditPlayerBalances(player_id, { playAdd: coupon.bonus_amount, type: 'coupon', notes: `Coupon ${code}` });
+  if (!balances) return res.status(404).json({ success: false, error: "Player not found" });
   couponRedemptions.add(key);
-  coupon.used_count += 1;
-
-  try {
-    const updated = await creditPlayerBalances(player_id, {
-      playAdd: coupon.bonus_amount,
-      type: 'coupon_bonus',
-      notes: `Redeemed coupon ${code} (+${coupon.bonus_amount} ETB Play Wallet)`
-    });
-    res.json({ success: true, coupon_amount: coupon.bonus_amount, balances: updated });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+  coupon.used_count++;
+  res.json({ success: true, coupon_amount: coupon.bonus_amount, balances });
 });
 
-// Withdrawal Request (Min 100 ETB, holds Main Wallet balance)
 app.post('/api/wallet/withdraw-request', async (req, res) => {
   const { player_id, method, account_number, account_name, amount } = req.body;
-  const amt = Number(amount);
-  if (!player_id || !amt || amt < MIN_WITHDRAWAL_AMOUNT) {
-    return res.status(400).json({ success: false, error: `Minimum withdrawal amount is ${MIN_WITHDRAWAL_AMOUNT} ETB.` });
+  if (!player_id || !amount || Number(amount) < MIN_WITHDRAWAL_AMOUNT) {
+    return res.status(400).json({ success: false, error: `Min ${MIN_WITHDRAWAL_AMOUNT} ETB` });
   }
-  if (!method || !account_number) {
-    return res.status(400).json({ success: false, error: "Payment method and account number are required." });
-  }
-
   try {
-    const { data: playerRow, error: pErr } = await supabase
-      .from('players').select('*').eq('player_id', player_id).single();
-    if (pErr || !playerRow) throw pErr || new Error("Player not found.");
-    if (playerRow.is_banned) return res.status(403).json({ success: false, error: "banned" });
-
-    const player = sanitizePlayer(playerRow);
-    if (player.main_balance < amt) {
-      return res.status(400).json({ success: false, error: "insufficient_main_balance", message: "Only Main Wallet balance (withdrawable) can be withdrawn." });
+    const player = await findPlayerById(player_id);
+    if (!player) return res.status(404).json({ success: false, error: "Player not found" });
+    const sp = sanitizePlayer(player);
+    if (sp.main_balance < Number(amount)) return res.status(400).json({ success: false, error: "Insufficient main balance" });
+    const balances = await creditPlayerBalances(player_id, { mainAdd: -Number(amount), type: 'withdrawal', notes: `Withdraw ${amount}` });
+    if (supabase) {
+      try {
+        await supabase.from('withdrawal_requests').insert([{
+          player_id, amount: Number(amount), method: method || 'Telebirr', account_number: account_number || '',
+          account_name: account_name || '', status: 'pending', requested_at: new Date().toISOString()
+        }]);
+      } catch (e) {}
     }
-
-    // Hold amount from Main Wallet immediately
-    const updated = await creditPlayerBalances(player_id, {
-      mainAdd: -amt,
-      type: 'withdrawal_hold',
-      notes: `Withdrawal request pending admin approval (${method}: ${account_number})`
-    });
-
-    const requestPayload = {
-      player_id,
-      amount: amt,
-      method,
-      account_number,
-      account_name: account_name || '',
-      status: 'pending',
-      requested_at: new Date().toISOString()
-    };
-
-    let request = null;
-    try {
-      const { data, error: insertErr } = await supabase
-        .from('withdrawal_requests')
-        .insert([requestPayload])
-        .select().single();
-      if (insertErr) throw insertErr;
-      request = data;
-    } catch (dbErr) {
-      request = { id: Date.now(), ...requestPayload };
-    }
-
-    res.json({ success: true, balances: updated, request });
+    res.json({ success: true, balances });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Fetch Player Withdrawals
 app.get('/api/wallet/withdrawals/:player_id', async (req, res) => {
+  if (!supabase) return res.json([]);
   try {
-    const { data, error } = await supabase
-      .from('withdrawal_requests')
-      .select('*')
-      .eq('player_id', req.params.player_id)
-      .order('requested_at', { ascending: false });
-    if (error) throw error;
+    const { data } = await supabase.from('withdrawal_requests').select('*').eq('player_id', req.params.player_id).order('requested_at', { ascending: false });
     res.json(data || []);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.json([]); }
 });
 
-// --- ADMIN API ROUTES ---
-
-app.get('/api/admin/overview', requireAdmin, async (req, res) => {
-  try {
-    const pot = await getRoundPot(currentActiveGameRoundId);
-    let participantCount = 0;
-    try {
-      const { count } = await supabase
-        .from('game_participants')
-        .select('*', { count: 'exact', head: true })
-        .eq('game_id', currentActiveGameRoundId);
-      participantCount = count || 0;
-    } catch (e) {}
-
-    res.json({
-      state: globalGameState,
-      game_id: currentActiveGameRoundId,
-      timeRemaining,
-      drawnBallsHistory,
-      pot,
-      potentialPayout: computePayout(pot, PAYOUT_PERCENTAGE),
-      participantCount,
-      minPlayersToStart: MIN_PLAYERS_TO_START,
-      cardPrice: CARD_PRICE,
-      payoutPercentage: PAYOUT_PERCENTAGE,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// ============ ADMIN ============
+app.get('/api/admin/overview', requireAdmin, (req, res) => {
+  res.json({ state: globalGameState, game_id: currentActiveGameRoundId, timeRemaining, participants: participantsOf(currentActiveGameRoundId).size, players: inMemoryPlayers.size });
 });
-
-app.get('/api/admin/deposits', requireAdmin, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('deposit_requests').select('*').order('requested_at', { ascending: false });
-    if (error) throw error;
-    res.json(data || []);
-  } catch (err) {
-    res.json(inMemoryDeposits);
-  }
-});
-
-app.post('/api/admin/deposits/:id/approve', requireAdmin, async (req, res) => {
-  const reqId = req.params.id;
-  try {
-    let depositReq = inMemoryDeposits.find(d => String(d.id) === String(reqId));
-    if (!depositReq) {
-      const { data } = await supabase.from('deposit_requests').select('*').eq('id', reqId).single();
-      depositReq = data;
-    }
-    if (!depositReq) return res.status(404).json({ error: "Deposit request not found." });
-
-    // Approve Deposit: Add amount to Main Wallet + 10% bonus to Play Wallet!
-    const amt = Number(depositReq.amount);
-    const bonus = Math.floor(amt * 0.10); // 10% Deposit Bonus
-
-    const updated = await creditPlayerBalances(depositReq.player_id, {
-      mainAdd: amt,
-      playAdd: bonus,
-      type: 'deposit_approved',
-      notes: `Approved deposit ${amt} ETB (+${bonus} ETB 10% Play Wallet Bonus)`
-    });
-
-    depositReq.status = 'approved';
-    try {
-      await supabase.from('deposit_requests').update({ status: 'approved' }).eq('id', reqId);
-    } catch (e) {}
-
-    res.json({ success: true, balances: updated });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/admin/deposits/:id/reject', requireAdmin, async (req, res) => {
-  const reqId = req.params.id;
-  try {
-    let depositReq = inMemoryDeposits.find(d => String(d.id) === String(reqId));
-    if (depositReq) depositReq.status = 'rejected';
-    try {
-      await supabase.from('deposit_requests').update({ status: 'rejected' }).eq('id', reqId);
-    } catch (e) {}
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/admin/withdrawals', requireAdmin, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('withdrawal_requests').select('*').order('requested_at', { ascending: false });
-    if (error) throw error;
-    res.json(data || []);
-  } catch (err) {
-    res.json([]);
-  }
-});
-
-app.post('/api/admin/withdrawals/:id/approve', requireAdmin, async (req, res) => {
-  try {
-    const { data: reqRow, error: fetchErr } = await supabase
-      .from('withdrawal_requests').select('*').eq('id', req.params.id).single();
-    if (fetchErr || !reqRow) throw fetchErr || new Error("Request not found.");
-
-    await supabase.from('withdrawal_requests').update({
-      status: 'approved', resolved_at: new Date().toISOString()
-    }).eq('id', req.params.id);
-
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post('/api/admin/withdrawals/:id/reject', requireAdmin, async (req, res) => {
-  try {
-    const { data: reqRow, error: fetchErr } = await supabase
-      .from('withdrawal_requests').select('*').eq('id', req.params.id).single();
-    if (fetchErr || !reqRow) throw fetchErr || new Error("Request not found.");
-
-    // Refund held amount to Main Wallet
-    const updated = await creditPlayerBalances(reqRow.player_id, {
-      mainAdd: Number(reqRow.amount),
-      type: 'withdrawal_rejected_refund',
-      notes: `Rejected withdrawal #${reqRow.id} - ${reqRow.amount} ETB refunded to Main Wallet`
-    });
-
-    await supabase.from('withdrawal_requests').update({
-      status: 'rejected', resolved_at: new Date().toISOString()
-    }).eq('id', req.params.id);
-
-    res.json({ success: true, balances: updated });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post('/api/admin/coupons/create', requireAdmin, (req, res) => {
-  const { code, bonus_amount, max_uses, expiry_date } = req.body;
-  if (!code || !bonus_amount) {
-    return res.status(400).json({ error: "Code and bonus amount required." });
-  }
-  const cleanCode = String(code).trim().toUpperCase();
-  const coupon = {
-    code: cleanCode,
-    bonus_amount: Number(bonus_amount),
-    max_uses: Number(max_uses || 100),
-    used_count: 0,
-    is_active: true,
-    expiry_date: expiry_date || '2030-01-01'
-  };
-  inMemoryCoupons.unshift(coupon);
-  res.json({ success: true, coupon });
-});
-
-app.get('/api/admin/coupons', requireAdmin, (req, res) => {
-  res.json(inMemoryCoupons);
-});
-
 app.get('/api/admin/players', requireAdmin, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('players').select('*').limit(200);
-    if (error) throw error;
-    const sanitized = (data || []).map(sanitizePlayer);
-    res.json(sanitized);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  res.json(Array.from(inMemoryPlayers.values()).map(sanitizePlayer));
 });
-
 app.post('/api/admin/players/:id/ban', requireAdmin, async (req, res) => {
-  try {
-    await supabase.from('players').update({ is_banned: true }).eq('player_id', req.params.id);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const p = await findPlayerById(req.params.id);
+  if (p) await savePlayer({ ...p, is_banned: true });
+  res.json({ success: true });
 });
-
 app.post('/api/admin/players/:id/unban', requireAdmin, async (req, res) => {
-  try {
-    await supabase.from('players').update({ is_banned: false }).eq('player_id', req.params.id);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const p = await findPlayerById(req.params.id);
+  if (p) await savePlayer({ ...p, is_banned: false });
+  res.json({ success: true });
 });
-
 app.post('/api/admin/credit-player', requireAdmin, async (req, res) => {
-  const { player_id, amount, wallet_type, notes } = req.body;
-  const amt = Number(amount);
-  if (!player_id || !amt) return res.status(400).json({ error: "player_id and amount required." });
-  try {
-    const isPlay = wallet_type === 'play';
-    const updated = await creditPlayerBalances(player_id, {
-      mainAdd: isPlay ? 0 : amt,
-      playAdd: isPlay ? amt : 0,
-      type: 'admin_credit',
-      notes: notes || `Admin manual credit to ${isPlay ? 'Play' : 'Main'} Wallet`
-    });
-    res.json({ success: true, balances: updated });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const { player_id, amount, wallet_type } = req.body;
+  if (!player_id || !amount) return res.status(400).json({ error: "Missing fields" });
+  const isPlay = wallet_type === 'play';
+  const balances = await creditPlayerBalances(player_id, {
+    mainAdd: isPlay ? 0 : Number(amount),
+    playAdd: isPlay ? Number(amount) : 0,
+    type: 'admin_credit', notes: 'Admin credit'
+  });
+  if (!balances) return res.status(404).json({ error: "Player not found" });
+  res.json({ success: true, balances });
 });
 
-// --- GAME LOOP & WINNER SPLIT LOGIC ---
+// ============ SPA CATCH-ALL (MUST BE LAST) ============
+// FIX: this used to be registered BEFORE every API route.
+// Works on both Express 4 and Express 5 (Express 5 rejects the bare '*' path).
+app.use((req, res, next) => {
+  if (req.method !== 'GET') return next();
+  const indexPath = path.join(__dirname, 'dist', 'index.html');
+  res.sendFile(indexPath, (err) => {
+    if (!err) return;
+    res.sendFile(path.join(__dirname, 'public', 'index.html'), (err2) => {
+      if (err2) res.status(200).send('Fast Bingo API Running');
+    });
+  });
+});
+
+// ============================================================
+//                        GAME LOOP
+// ============================================================
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: '*', methods: ["GET", "POST"], credentials: true },
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  path: '/socket.io',
+  transports: ['websocket', 'polling'],
+  serveClient: true
+});
 
 let globalGameState = "waiting";
 let timeRemaining = INITIAL_WAIT_SECONDS;
@@ -972,8 +689,20 @@ let currentRoundPot = 0;
 let ballPool = [];
 let drawnBallsHistory = [];
 let gameBallInterval = null;
-let tickBusy = false;
-let currentRoundWinners = []; // Tracks simultaneous winners for split payouts
+let currentRoundWinners = [];
+
+function tickPayload() {
+  return {
+    gameId: currentActiveGameRoundId,
+    state: globalGameState,
+    timeRemaining,
+    drawnHistory: drawnBallsHistory,
+    participantCount: participantsOf(currentActiveGameRoundId).size,
+    minPlayersToStart: MIN_PLAYERS_TO_START,
+    serverTime: Date.now()
+  };
+}
+function broadcastTick() { io.emit('room_tick', tickPayload()); }
 
 function resetBallPool() {
   ballPool = [];
@@ -982,239 +711,134 @@ function resetBallPool() {
   for (let i = 1; i <= 75; i++) ballPool.push(i);
 }
 
-async function getRoundPot(game_id) {
-  try {
-    const { data, error } = await supabase
-      .from('game_participants')
-      .select('purchased_cards')
-      .eq('game_id', game_id);
-    if (error || !data) return 0;
-    const totalCards = data.reduce((sum, row) => sum + (Number(row.purchased_cards) || 0), 0);
-    return totalCards * CARD_PRICE;
-  } catch (err) {
-    return 0;
-  }
-}
-
-async function startNewRound() {
+function startNewRound() {
+  if (currentActiveGameRoundId) roundParticipants.delete(currentActiveGameRoundId);
   currentActiveGameRoundId = generateRoundId();
   globalGameState = "waiting";
   timeRemaining = INITIAL_WAIT_SECONDS;
   currentRoundPot = 0;
   drawnBallsHistory = [];
   currentRoundWinners = [];
-  try {
-    await supabase.from('rounds').insert([{ game_id: currentActiveGameRoundId, state: 'waiting' }]);
-  } catch (err) {}
+  participantsOf(currentActiveGameRoundId);
+  console.log("🆕 New round:", currentActiveGameRoundId);
+  if (supabase) {
+    supabase.from('rounds').insert([{ game_id: currentActiveGameRoundId, state: 'waiting' }]).then(() => {}, () => {});
+  }
+  io.emit('new_round', tickPayload());
+  broadcastTick();
 }
 
-function startBallDrawingSequence() {
+function startBallDrawing() {
   if (gameBallInterval) clearInterval(gameBallInterval);
   gameBallInterval = setInterval(() => {
-    if (globalGameState !== "playing") {
-      clearInterval(gameBallInterval);
-      return;
-    }
+    if (globalGameState !== "playing") { clearInterval(gameBallInterval); return; }
     if (ballPool.length === 0) {
       clearInterval(gameBallInterval);
-      globalGameState = "waiting";
-      timeRemaining = POST_ROUND_PAUSE_SECONDS;
-      io.emit('opponent_victory', { winnerName: "No one (All Numbers Called)", cardNum: "N/A", winnerPlayerId: null, isSplit: false });
+      io.emit('opponent_victory', { winnerName: "No Winner", cardNum: "N/A", winnerPlayerId: null });
       startNewRound();
       return;
     }
-    const drawnNumber = drawRandomBall(ballPool);
-    ballPool = ballPool.filter(n => n !== drawnNumber);
-    drawnBallsHistory.push(drawnNumber);
-
-    io.emit('ball_drawn', {
-      number: drawnNumber,
-      pool: drawnBallsHistory
-    });
+    const num = drawRandomBall(ballPool);
+    ballPool = ballPool.filter(n => n !== num);
+    drawnBallsHistory.push(num);
+    io.emit('ball_drawn', { number: num, pool: drawnBallsHistory });
   }, 3000);
 }
 
-// Multi-Winner Split Resolution
 async function resolveRoundWinners() {
   if (gameBallInterval) clearInterval(gameBallInterval);
   globalGameState = "waiting";
   timeRemaining = POST_ROUND_PAUSE_SECONDS;
 
-  const winnerCount = currentRoundWinners.length;
-  if (winnerCount === 0) {
-    await startNewRound();
-    return;
-  }
+  if (currentRoundWinners.length === 0) { startNewRound(); return; }
 
-  const totalPayout = computePayout(currentRoundPot, PAYOUT_PERCENTAGE);
-  const payoutPerWinner = Math.floor(totalPayout / winnerCount);
-
+  const payout = Math.floor((currentRoundPot * PAYOUT_PERCENTAGE) / currentRoundWinners.length);
   for (const winner of currentRoundWinners) {
-    try {
-      await creditPlayerBalances(winner.player_id, {
-        mainAdd: payoutPerWinner, // Winnings added to withdrawable Main Wallet!
-        type: 'payout',
-        game_id: currentActiveGameRoundId,
-        notes: `Bingo Win on Card #${winner.cardNum}${winnerCount > 1 ? ` (Split ${winnerCount} ways)` : ''}`
-      });
-      await supabase.from('game_participants')
-        .update({ is_winner: true })
-        .eq('game_id', currentActiveGameRoundId)
-        .eq('player_id', winner.player_id);
-    } catch (err) {
-      console.error("Error crediting winner:", err);
+    await creditPlayerBalances(winner.player_id, { mainAdd: payout, type: 'payout', game_id: currentActiveGameRoundId, notes: `Bingo! Card #${winner.cardNum}` });
+    if (supabase) {
+      try {
+        await supabase.from('game_participants').update({ is_winner: true })
+          .eq('game_id', currentActiveGameRoundId).eq('player_id', winner.player_id);
+      } catch (e) {}
     }
   }
-
-  const winnerNames = currentRoundWinners.map(w => w.username).join(', ');
-  const primaryWinner = currentRoundWinners[0];
-
   io.emit('opponent_victory', {
-    winnerName: winnerNames,
-    cardNum: primaryWinner.cardNum,
-    winnerPlayerId: primaryWinner.player_id,
-    payoutAmount: payoutPerWinner,
-    isSplit: winnerCount > 1,
-    splitCount: winnerCount
+    winnerName: currentRoundWinners.map(w => w.username).join(', '),
+    cardNum: currentRoundWinners[0].cardNum,
+    winnerPlayerId: currentRoundWinners[0].player_id,
+    payoutAmount: payout,
+    isSplit: currentRoundWinners.length > 1
   });
-
-  await startNewRound();
+  startNewRound();
 }
 
-// Global 1-second Tick Loop
-setInterval(async () => {
-  if (tickBusy || !currentActiveGameRoundId) return;
-  tickBusy = true;
+// FIX: the tick is now fully synchronous + always emits, so the countdown
+// can never stall on a slow/failing database call.
+setInterval(() => {
   try {
+    if (!currentActiveGameRoundId) { startNewRound(); return; }
+
     if (globalGameState === "waiting") {
       timeRemaining--;
       if (timeRemaining <= 0) {
-        let participantCount = 0;
-        try {
-          const { count } = await supabase
-            .from('game_participants')
-            .select('*', { count: 'exact', head: true })
-            .eq('game_id', currentActiveGameRoundId);
-          participantCount = count || 0;
-        } catch (e) {}
-
-        if (participantCount < MIN_PLAYERS_TO_START) {
-          // Re-check countdown loops back to 40 seconds!
+        const count = participantsOf(currentActiveGameRoundId).size;
+        if (count < MIN_PLAYERS_TO_START) {
+          console.log(`⏳ Players: ${count}/${MIN_PLAYERS_TO_START}, restarting wait...`);
           timeRemaining = RECHECK_WAIT_SECONDS;
         } else {
+          console.log(`🎮 Starting game with ${count} players!`);
           globalGameState = "playing";
           resetBallPool();
-          currentRoundPot = await getRoundPot(currentActiveGameRoundId);
-          startBallDrawingSequence();
+          currentRoundPot = Array.from(participantsOf(currentActiveGameRoundId).values())
+            .reduce((s, p) => s + (Number(p.purchased_cards) || 0), 0) * CARD_PRICE;
+          io.emit('game_started', tickPayload());
+          startBallDrawing();
         }
       }
     }
-
-    let liveParticipantCount = 0;
-    try {
-      const { count } = await supabase
-        .from('game_participants')
-        .select('*', { count: 'exact', head: true })
-        .eq('game_id', currentActiveGameRoundId);
-      liveParticipantCount = count || 0;
-    } catch (e) {}
-
-    io.emit('room_tick', {
-      gameId: currentActiveGameRoundId,
-      state: globalGameState,
-      timeRemaining,
-      drawnHistory: drawnBallsHistory,
-      participantCount: liveParticipantCount,
-      minPlayersToStart: MIN_PLAYERS_TO_START,
-    });
+    broadcastTick();
   } catch (err) {
-    console.error("Game loop error:", err.message);
-  } finally {
-    tickBusy = false;
+    console.error("Tick error:", err.message);
   }
 }, 1000);
 
-// Socket.io Handlers
 io.on('connection', (socket) => {
-  socket.on('sync_player_profile', async (playerData) => {
-    if (playerData && playerData.player_id) {
-      await savePlayer(playerData);
-    }
-  });
+  console.log("🔌 Client connected:", socket.id);
+  socket.emit('room_tick', tickPayload());
 
-  socket.emit('room_tick', {
-    gameId: currentActiveGameRoundId,
-    state: globalGameState,
-    timeRemaining,
-    drawnHistory: drawnBallsHistory,
-    minPlayersToStart: MIN_PLAYERS_TO_START,
+  socket.on('request_tick', () => socket.emit('room_tick', tickPayload()));
+
+  socket.on('sync_player_profile', async (data) => {
+    if (data?.player_id) {
+      const existing = await findPlayerById(data.player_id);
+      if (existing) await savePlayer({ ...existing, username: data.username || existing.username });
+    }
   });
 
   socket.on('claim_bingo', async (data) => {
     if (globalGameState !== "playing") return;
     const { player_id, cardNum } = data || {};
     if (!player_id || !cardNum) return;
-
-    // Check if player already registered in winners list
     if (currentRoundWinners.some(w => w.player_id === player_id)) return;
 
-    try {
-      // Validate card winning pattern (Rows, Cols, Diagonals, 4 Corners)
-      if (!cardHasWinningLine(Number(cardNum), drawnBallsHistory)) return;
+    const part = participantsOf(currentActiveGameRoundId).get(player_id);
+    if (!part || !(part.cards || []).map(Number).includes(Number(cardNum))) return;
+    if (!cardHasWinningLine(Number(cardNum), drawnBallsHistory)) return;
 
-      const { data: playerRow } = await supabase
-        .from('players').select('*').eq('player_id', player_id).single();
-      if (!playerRow || playerRow.is_banned) return;
+    const player = await findPlayerById(player_id);
+    if (!player || player.is_banned) return;
 
-      currentRoundWinners.push({
-        player_id,
-        username: playerRow.username || `Player_${player_id.substring(0, 4)}`,
-        cardNum
-      });
-
-      // Wait a brief moment to collect simultaneous claims (split payouts)
-      setTimeout(() => {
-        resolveRoundWinners();
-      }, 500);
-
-    } catch (err) {
-      console.error("Bingo claim error:", err.message);
-    }
+    currentRoundWinners.push({ player_id, username: player.username || 'Player', cardNum });
+    console.log("🏆 Bingo:", player.username, "Card #", cardNum);
+    setTimeout(() => resolveRoundWinners(), 500);
   });
+
+  socket.on('disconnect', () => console.log("🔌 Client disconnected:", socket.id));
 });
 
-async function bootServer() {
-  if (process.env.NODE_ENV !== "production") {
-    try {
-      const { createServer: createViteServer } = await import('vite');
-      const vite = await createViteServer({
-        server: { middlewareMode: true },
-        appType: 'spa'
-      });
-      app.use(vite.middlewares);
-    } catch (err) {
-      console.error("Vite middleware load error, falling back to static dist:", err);
-      const distPath = path.join(__dirname, 'dist');
-      app.use(express.static(distPath));
-      app.get('*', (req, res) => {
-        res.sendFile(path.join(distPath, 'index.html'));
-      });
-    }
-  } else {
-    const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
-
-  startNewRound();
-  httpServer.listen(PORT, "0.0.0.0", () => {
-    console.log(`⚡ Fast Bingo server running on port ${PORT}`);
-    console.log(`📱 Telegram Group Bonus: ${TG_GROUP_BONUS} ETB for joining group`);
-    console.log(`🎁 Signup Bonus: ${SIGNUP_BONUS} ETB base bonus`);
-    console.log(`💰 Total possible welcome bonus: ${SIGNUP_BONUS + TG_GROUP_BONUS} ETB`);
-  });
-}
-
-bootServer();
+startNewRound();
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`⚡ Fast Bingo running on http://0.0.0.0:${PORT}`);
+  console.log(`📊 Card=${CARD_PRICE}ETB, MinPlayers=${MIN_PLAYERS_TO_START}, Wait=${INITIAL_WAIT_SECONDS}s`);
+  console.log(`🤖 Bot token: ${BOT_TOKEN ? 'set' : 'MISSING (initData cannot be verified!)'}`);
+});

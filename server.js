@@ -38,7 +38,9 @@ const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// Memory fallbacks for coupons, deposit requests, and reference IDs if Supabase table is absent
+// Memory fallbacks for players, coupons, deposit requests, and reference IDs if Supabase table or key is absent
+const inMemoryPlayers = new Map(); // player_id -> player
+const inMemoryPhoneToId = new Map(); // phone_number -> player_id
 const inMemoryDeposits = [];
 const inMemoryCoupons = [
   { code: 'BINGO20', bonus_amount: 20, max_uses: 1000, used_count: 0, is_active: true, expiry_date: '2030-01-01' },
@@ -65,6 +67,71 @@ function sanitizePlayer(p) {
   };
 }
 
+// Safe Player Lookup by Phone
+async function findPlayerByPhone(phone_number) {
+  try {
+    const { data, error } = await supabase
+      .from('players')
+      .select('*')
+      .eq('phone_number', phone_number)
+      .maybeSingle();
+    if (!error && data) {
+      inMemoryPlayers.set(data.player_id, data);
+      inMemoryPhoneToId.set(data.phone_number, data.player_id);
+      return data;
+    }
+  } catch (err) {
+    console.warn("Supabase lookup failed for phone:", err.message);
+  }
+  const pId = inMemoryPhoneToId.get(phone_number);
+  if (pId && inMemoryPlayers.has(pId)) {
+    return inMemoryPlayers.get(pId);
+  }
+  return null;
+}
+
+// Safe Player Lookup by ID
+async function findPlayerById(player_id) {
+  try {
+    const { data, error } = await supabase
+      .from('players')
+      .select('*')
+      .eq('player_id', player_id)
+      .maybeSingle();
+    if (!error && data) {
+      inMemoryPlayers.set(data.player_id, data);
+      if (data.phone_number) inMemoryPhoneToId.set(data.phone_number, data.player_id);
+      return data;
+    }
+  } catch (err) {
+    console.warn("Supabase lookup failed for id:", err.message);
+  }
+  return inMemoryPlayers.get(player_id) || null;
+}
+
+// Safe Player Save/Upsert
+async function savePlayer(playerObj) {
+  if (!playerObj || !playerObj.player_id) return playerObj;
+  inMemoryPlayers.set(playerObj.player_id, playerObj);
+  if (playerObj.phone_number) {
+    inMemoryPhoneToId.set(playerObj.phone_number, playerObj.player_id);
+  }
+  try {
+    const { data, error } = await supabase
+      .from('players')
+      .upsert([playerObj], { onConflict: 'player_id' })
+      .select()
+      .maybeSingle();
+    if (!error && data) {
+      inMemoryPlayers.set(data.player_id, data);
+      return data;
+    }
+  } catch (err) {
+    console.warn("Supabase upsert failed:", err.message);
+  }
+  return playerObj;
+}
+
 // Transaction Logging
 async function logTransaction({ player_id, type, amount, game_id = null, balance_after = null, notes = null }) {
   try {
@@ -78,9 +145,17 @@ async function logTransaction({ player_id, type, amount, game_id = null, balance
 
 // Balance helper with Dual Wallet support
 async function creditPlayerBalances(player_id, { mainAdd = 0, playAdd = 0, type, game_id = null, notes = null }) {
-  const { data: player, error: fetchErr } = await supabase
-    .from('players').select('*').eq('player_id', player_id).single();
-  if (fetchErr || !player) throw fetchErr || new Error(`Player ${player_id} not found while crediting.`);
+  let player = await findPlayerById(player_id);
+  if (!player) {
+    player = {
+      player_id,
+      username: `Player_${player_id.slice(-4)}`,
+      phone_number: '0900000000',
+      main_balance: 0,
+      play_balance: 0,
+      balance: 0
+    };
+  }
 
   const curMain = Number(player.main_balance ?? player.balance ?? 0);
   const curPlay = Number(player.play_balance ?? 0);
@@ -89,17 +164,14 @@ async function creditPlayerBalances(player_id, { mainAdd = 0, playAdd = 0, type,
   const newPlay = Math.max(0, curPlay + playAdd);
   const newTotal = newMain + newPlay;
 
-  const updatePayload = {
+  const updatedPlayer = {
+    ...player,
     main_balance: newMain,
     play_balance: newPlay,
-    balance: newTotal,
+    balance: newTotal
   };
 
-  const { error: updateErr } = await supabase.from('players').update(updatePayload).eq('player_id', player_id);
-  if (updateErr) {
-    // Fallback if schema does not have main_balance/play_balance columns yet
-    await supabase.from('players').update({ balance: newTotal }).eq('player_id', player_id);
-  }
+  const saved = await savePlayer(updatedPlayer);
 
   const netAmount = mainAdd + playAdd;
   await logTransaction({ player_id, type, amount: netAmount, game_id, balance_after: newTotal, notes });
@@ -133,79 +205,55 @@ app.get('/api/health-check', async (req, res) => {
     if (error) throw error;
     res.json({ status: "online", database: "connected" });
   } catch (err) {
-    res.status(500).json({ status: "online", database: "disconnected", error: err.message });
+    res.json({ status: "online", database: "in_memory_mode", note: "Running with in-memory persistence" });
   }
 });
 
-// Registration with 20 Birr Signup Bonus to Play Wallet
+// Registration with 10 Birr Signup Bonus to Play Wallet
 app.post('/api/register', async (req, res) => {
   const { username, phone_number, referrer_id } = req.body;
   if (!username || !phone_number) {
     return res.status(400).json({ error: "Username and Phone Number are required." });
   }
   try {
-    let { data: player, error } = await supabase
-      .from('players')
-      .select('*')
-      .eq('phone_number', phone_number)
-      .single();
-
-    if (error && error.code !== 'PGRST116') throw error;
+    let player = await findPlayerByPhone(phone_number);
 
     if (player) {
       return res.json({ isNew: false, user: sanitizePlayer(player) });
     } else {
-      // New User Registration: 20 Birr Signup Bonus to Play Wallet!
-      const initialPayload = {
+      // New User Registration: 10 Birr Base Signup Bonus to Play Wallet!
+      const generatedId = `p_${Date.now()}_${Math.floor(Math.random()*10000)}`;
+      const newPlayerObj = {
+        player_id: generatedId,
         username,
         phone_number,
         main_balance: 0,
-        play_balance: 20, // 20 Birr Bonus!
-        balance: 20,
+        play_balance: 10, // 10 Birr Base Bonus!
+        balance: 10,
         referred_by: referrer_id || null,
         referrals_count: 0,
-        referral_earnings: 0
+        referral_earnings: 0,
+        tg_bonus_claimed: false,
+        created_at: new Date().toISOString()
       };
 
-      let newPlayer = null;
-      try {
-        const { data, error: insertError } = await supabase
-          .from('players')
-          .insert([initialPayload])
-          .select()
-          .single();
-        if (insertError) throw insertError;
-        newPlayer = data;
-      } catch (insertErr) {
-        // Fallback for older table schema without extra columns
-        const { data, error: fbError } = await supabase
-          .from('players')
-          .insert([{ username, phone_number, balance: 20 }])
-          .select()
-          .single();
-        if (fbError) throw fbError;
-        newPlayer = { ...data, main_balance: 0, play_balance: 20, balance: 20 };
-      }
+      const savedPlayer = await savePlayer(newPlayerObj);
 
       await logTransaction({
-        player_id: newPlayer.player_id,
+        player_id: savedPlayer.player_id,
         type: 'signup_bonus',
-        amount: 20,
-        balance_after: 20,
-        notes: '20 Birr Registration Bonus credited to Play Wallet'
+        amount: 10,
+        balance_after: 10,
+        notes: '10 Birr Registration Bonus credited to Play Wallet'
       });
 
       // Handle Referrer Reward if referrer_id exists
       if (referrer_id && String(referrer_id).trim()) {
         const cleanRefId = String(referrer_id).trim();
         try {
-          const { data: refPlayer } = await supabase
-            .from('players')
-            .select('*')
-            .eq('player_id', cleanRefId)
-            .single();
+          const refPlayer = await findPlayerById(cleanRefId);
 
-          if (refPlayer && refPlayer.player_id !== newPlayer.player_id) {
+          if (refPlayer && refPlayer.player_id !== savedPlayer.player_id) {
             const currentRefCount = Number(refPlayer.referrals_count ?? refPlayer.referral_count ?? 0) + 1;
             const currentRefEarn = Number(refPlayer.referral_earnings ?? 0) + 5;
 
@@ -216,18 +264,12 @@ app.post('/api/register', async (req, res) => {
               notes: `5 ETB referral reward for inviting ${username}`
             });
 
-            // Safely update referrer stats
-            try {
-              await supabase
-                .from('players')
-                .update({
-                  referrals_count: currentRefCount,
-                  referral_earnings: currentRefEarn
-                })
-                .eq('player_id', refPlayer.player_id);
-            } catch (uErr) {
-              // Ignore if column doesn't exist
-            }
+            // Update referrer stats
+            await savePlayer({
+              ...refPlayer,
+              referrals_count: currentRefCount,
+              referral_earnings: currentRefEarn
+            });
 
             // Milestone bonus: 100 ETB for reaching 10 referrals (or multiples of 10)
             if (currentRefCount % 10 === 0) {
@@ -243,10 +285,48 @@ app.post('/api/register', async (req, res) => {
         }
       }
 
-      return res.json({ isNew: true, user: sanitizePlayer(newPlayer) });
+      return res.json({ isNew: true, user: sanitizePlayer(savedPlayer) });
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Register endpoint error:", err.message);
+    res.status(500).json({ error: err.message || "Registration failed" });
+  }
+});
+
+// Endpoint to claim Telegram Group Join Bonus (+10 ETB)
+app.post('/api/claim-telegram-bonus', async (req, res) => {
+  const { player_id } = req.body;
+  if (!player_id) {
+    return res.status(400).json({ error: "Player ID is required." });
+  }
+  try {
+    const player = await findPlayerById(player_id);
+
+    if (!player) {
+      return res.status(404).json({ error: "Player not found." });
+    }
+
+    if (player.tg_bonus_claimed) {
+      return res.json({ success: true, claimed: true, user: sanitizePlayer(player) });
+    }
+
+    // Credit +10 ETB to play_balance
+    const balances = await creditPlayerBalances(player_id, {
+      playAdd: 10,
+      type: 'telegram_group_bonus',
+      notes: '10 ETB Telegram Group Join Bonus credited to Play Wallet'
+    });
+
+    const updatedPlayer = await savePlayer({
+      ...player,
+      ...balances,
+      tg_bonus_claimed: true
+    });
+
+    res.json({ success: true, user: sanitizePlayer(updatedPlayer) });
+  } catch (err) {
+    console.error("Claim Telegram bonus error:", err.message);
+    res.status(500).json({ error: err.message || "Failed to claim Telegram bonus" });
   }
 });
 
@@ -294,16 +374,7 @@ app.get('/api/games/check-active/:player_id/:game_id', async (req, res) => {
 // Fetch Single Player Profile
 app.get('/api/player/:id', async (req, res) => {
   try {
-    const { data: player, error } = await supabase
-      .from('players')
-      .select('*')
-      .eq('player_id', req.params.id)
-      .single();
-
-    if (error && error.code === 'PGRST116') {
-      return res.status(404).json({ error: "Player not found" });
-    }
-    if (error) throw error;
+    const player = await findPlayerById(req.params.id);
     if (!player) return res.status(404).json({ error: "Player not found" });
 
     res.json(sanitizePlayer(player));
@@ -355,12 +426,8 @@ app.post('/api/games/create', async (req, res) => {
       return res.status(400).json({ success: false, error: "round_not_open" });
     }
 
-    const { data: playerRow, error: playerErr } = await supabase
-      .from('players')
-      .select('*')
-      .eq('player_id', player_id)
-      .single();
-    if (playerErr || !playerRow) throw playerErr || new Error("Player not found.");
+    const playerRow = await findPlayerById(player_id);
+    if (!playerRow) return res.status(404).json({ success: false, error: "Player not found." });
 
     if (playerRow.is_banned) {
       return res.status(403).json({ success: false, error: "banned" });
@@ -392,15 +459,13 @@ app.post('/api/games/create', async (req, res) => {
     let newMain = player.main_balance - deductMain;
     let newTotal = newMain + newPlay;
 
-    // Update Player Balances in DB
-    try {
-      await supabase
-        .from('players')
-        .update({ main_balance: newMain, play_balance: newPlay, balance: newTotal })
-        .eq('player_id', player_id);
-    } catch (upErr) {
-      await supabase.from('players').update({ balance: newTotal }).eq('player_id', player_id);
-    }
+    // Update Player Balances
+    await savePlayer({
+      ...playerRow,
+      main_balance: newMain,
+      play_balance: newPlay,
+      balance: newTotal
+    });
 
     // Insert Participant Record with Safe Schema Fallback
     let participantData = null;

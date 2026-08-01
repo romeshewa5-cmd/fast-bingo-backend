@@ -281,6 +281,18 @@ function requireAdmin(req, res, next) {
 //                        API ROUTES
 // ============================================================
 
+// Shows whether Telegram is actually delivering updates to THIS server.
+app.get('/api/debug/webhook', async (req, res) => {
+  const out = { updates_received: webhookHits, last_update_at: lastWebhookAt || null };
+  if (BOT_TOKEN) {
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo`);
+      out.telegram = (await r.json()).result || null;
+    } catch (e) { out.telegram_error = e.message; }
+  }
+  res.json(out);
+});
+
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -405,6 +417,8 @@ async function createPlayer({ username, phone_number, telegram_id, referrer_id }
  * message with `contact` -> that's the ONLY reliable way to get a real phone.
  */
 const seenUpdateIds = new Set();
+let webhookHits = 0;
+let lastWebhookAt = null;
 
 // ============ AMHARIC BOT COPY ============
 const T = {
@@ -518,7 +532,10 @@ async function finishOnboarding(chat_id, tid) {
 
 app.post('/api/telegram/webhook', async (req, res) => {
   res.sendStatus(200);
+  webhookHits++;
+  lastWebhookAt = new Date().toISOString();
   try {
+    console.log("📨 update:", JSON.stringify(req.body).slice(0, 300));
     // Telegram retries an update until it gets a 200. On a cold Render instance
     // the first replies are slow, so the same contact arrived 9 times.
     const uid = req.body?.update_id;

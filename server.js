@@ -53,8 +53,22 @@ const ALLOW_UNVERIFIED_INITDATA = String(process.env.ALLOW_UNVERIFIED_INITDATA |
 // Must be https. Used for the in-bot web_app buttons.
 const WEBAPP_URL = (process.env.WEBAPP_URL || '').trim();
 // Bonus group: link users tap, and the numeric/@ id used to VERIFY membership.
-const TG_GROUP_LINK = (process.env.TG_GROUP_LINK || '').trim();
-const TG_GROUP_ID = (process.env.TG_GROUP_ID || '').trim();   // e.g. -1001234567890
+// Auto-fix common paste mistakes so a small typo doesn't silently disable things.
+let TG_GROUP_LINK = (process.env.TG_GROUP_LINK || '').trim();
+if (TG_GROUP_LINK && !/^https?:\/\//i.test(TG_GROUP_LINK)) {
+  // "t.me/Fast_bingo_game" -> "https://t.me/Fast_bingo_game"
+  TG_GROUP_LINK = 'https://' + TG_GROUP_LINK.replace(/^\/+/, '');
+  console.warn("⚠️ TG_GROUP_LINK had no scheme - corrected to", TG_GROUP_LINK);
+}
+
+let TG_GROUP_ID = (process.env.TG_GROUP_ID || '').trim();
+if (/^\d+$/.test(TG_GROUP_ID)) {
+  // Supergroup ids are NEGATIVE and start with -100. A bare "1003849071574"
+  // is a "-100..." id with the sign (and sometimes the 100) stripped on paste.
+  TG_GROUP_ID = TG_GROUP_ID.startsWith('100') ? '-' + TG_GROUP_ID : '-100' + TG_GROUP_ID;
+  console.warn("⚠️ TG_GROUP_ID looked positive - corrected to", TG_GROUP_ID);
+}
+const TG_GROUP_ID_OK = !TG_GROUP_ID || /^(-100\d+|@[\w]+)$/.test(TG_GROUP_ID);
 const BOT_USERNAME_ENV = (process.env.BOT_USERNAME || '').trim().replace(/^@/, '');
 const SUPPORT_CONTACT = (process.env.SUPPORT_CONTACT || '@YourSupport').trim();
 const CARD_PRICE = Number(process.env.CARD_PRICE) || 10;
@@ -469,10 +483,20 @@ async function isGroupMember(tid) {
     );
     const d = await r.json();
     if (!d.ok) {
-      console.warn("getChatMember failed:", d.description);
+      // Loud, because the fallback is to PAY the bonus unverified.
+      console.error("❌ getChatMember FAILED:", d.error_code, d.description);
+      console.error("   chat_id used:", TG_GROUP_ID, "| user:", tid);
+      if (/chat not found/i.test(d.description || '')) {
+        console.error("   -> wrong TG_GROUP_ID, or the bot was never added to the group.");
+      }
+      if (/not enough rights|member list is inaccessible/i.test(d.description || '')) {
+        console.error("   -> the bot must be an ADMINISTRATOR in the group.");
+      }
       return null;
     }
-    return ['creator', 'administrator', 'member', 'restricted'].includes(d.result.status);
+    const status = d.result.status;
+    console.log("👥 getChatMember", tid, "->", status);
+    return ['creator', 'administrator', 'member', 'restricted'].includes(status);
   } catch (e) {
     console.warn("getChatMember error:", e.message);
     return null;
@@ -1160,5 +1184,8 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`🤖 Bot token: ${BOT_TOKEN ? 'set' : 'MISSING (initData cannot be verified!)'}`);
   console.log(`🔗 WEBAPP_URL: ${WEBAPP_URL || 'NOT SET (in-bot Play button disabled)'}`);
   console.log(`👥 TG_GROUP_ID: ${TG_GROUP_ID || 'NOT SET (group membership cannot be verified - bonus pays without joining!)'}`);
+  if (TG_GROUP_ID && !TG_GROUP_ID_OK) {
+    console.warn(`   ⚠️ TG_GROUP_ID "${TG_GROUP_ID}" does not look like a supergroup id (-100...) or @username`);
+  }
   console.log(`✈️ TG_GROUP_LINK: ${TG_GROUP_LINK || 'NOT SET'}`);
 });

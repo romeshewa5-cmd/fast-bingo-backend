@@ -537,6 +537,16 @@ app.post('/api/telegram/webhook', async (req, res) => {
 
     const text = (msg.text || '').trim();
 
+    // Setup helper: post /id in ANY chat (including your group) and the bot
+    // replies with that chat's numeric id. Safe to leave in - it only echoes
+    // the id of the chat it's already in.
+    if (text.startsWith('/id')) {
+      await tgSend(chatId,
+        `Chat ID: <code>${chatId}</code>\nType: ${msg.chat.type}\nTitle: ${msg.chat.title || '-'}`);
+      console.log("🆔 /id ->", chatId, msg.chat.type, msg.chat.title || '');
+      return;
+    }
+
     if (text.startsWith('/start')) {
       const player = await findPlayerByTelegramId(tid);
       if (!player || !tgPhoneBook.has(tid)) {
@@ -909,6 +919,59 @@ app.post('/api/admin/credit-player', requireAdmin, async (req, res) => {
   res.json({ success: true, balances });
 });
 
+/**
+ * TESTING ONLY - wipe a player so you can re-run onboarding from scratch.
+ * Clears: Supabase row, in-memory caches, disk file, and the bot phonebook
+ * (the phonebook matters - without clearing it the bot skips the phone step).
+ *
+ *   curl -X POST https://<backend>/api/admin/reset-player \
+ *     -H "Content-Type: application/json" \
+ *     -H "x-admin-secret: <ADMIN_SECRET>" \
+ *     -d '{"telegram_id":"384714105"}'
+ */
+app.post('/api/admin/reset-player', requireAdmin, async (req, res) => {
+  const { telegram_id, phone_number, player_id } = req.body || {};
+  if (!telegram_id && !phone_number && !player_id) {
+    return res.status(400).json({ error: "Provide telegram_id, phone_number or player_id" });
+  }
+
+  let player = null;
+  if (player_id) player = await findPlayerById(player_id);
+  if (!player && telegram_id) player = await findPlayerByTelegramId(telegram_id);
+  if (!player && phone_number) player = await findPlayerByPhone(phone_number);
+
+  const removed = { supabase: false, memory: false, phonebook: false };
+  const tid = String(telegram_id || player?.telegram_id || '');
+
+  if (player) {
+    if (supabase) {
+      try {
+        await supabase.from('game_participants').delete().eq('player_id', player.player_id);
+        await supabase.from('transactions').delete().eq('player_id', player.player_id);
+        const { error } = await supabase.from('players').delete().eq('player_id', player.player_id);
+        removed.supabase = !error;
+        if (error) console.warn("reset: supabase delete failed:", error.message);
+      } catch (e) { console.warn("reset: supabase error:", e.message); }
+    }
+    inMemoryPlayers.delete(player.player_id);
+    if (player.phone_number) inMemoryPhoneToId.delete(String(player.phone_number));
+    if (player.telegram_id) inMemoryTgToId.delete(String(player.telegram_id));
+    roundParticipants.forEach(m => m.delete(player.player_id));
+    removed.memory = true;
+  }
+
+  if (tid && tgPhoneBook.has(tid)) { tgPhoneBook.delete(tid); removed.phonebook = true; }
+  if (phone_number) {
+    for (const [k, v] of tgPhoneBook.entries()) {
+      if (v === phone_number) { tgPhoneBook.delete(k); removed.phonebook = true; }
+    }
+  }
+  flushDisk();
+
+  console.log("🧹 Reset player:", player ? player.player_id : '(none)', JSON.stringify(removed));
+  res.json({ success: true, found: !!player, player_id: player?.player_id || null, removed });
+});
+
 // ============ SPA CATCH-ALL (MUST BE LAST) ============
 // FIX: this used to be registered BEFORE every API route.
 // Works on both Express 4 and Express 5 (Express 5 rejects the bare '*' path).
@@ -1096,4 +1159,6 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`📊 Card=${CARD_PRICE}ETB, MinPlayers=${MIN_PLAYERS_TO_START}, Wait=${INITIAL_WAIT_SECONDS}s`);
   console.log(`🤖 Bot token: ${BOT_TOKEN ? 'set' : 'MISSING (initData cannot be verified!)'}`);
   console.log(`🔗 WEBAPP_URL: ${WEBAPP_URL || 'NOT SET (in-bot Play button disabled)'}`);
+  console.log(`👥 TG_GROUP_ID: ${TG_GROUP_ID || 'NOT SET (group membership cannot be verified - bonus pays without joining!)'}`);
+  console.log(`✈️ TG_GROUP_LINK: ${TG_GROUP_LINK || 'NOT SET'}`);
 });

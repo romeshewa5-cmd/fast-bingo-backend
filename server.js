@@ -282,6 +282,16 @@ function requireAdmin(req, res, next) {
 // ============================================================
 
 // Shows whether Telegram is actually delivering updates to THIS server.
+app.post('/api/auth/token', async (req, res) => {
+  const { token } = req.body || {};
+  const rec = token && loginTokens.get(String(token));
+  if (!rec) return res.status(401).json({ error: 'invalid_token' });
+  const player = await findPlayerByTelegramId(rec.tid);
+  if (!player) return res.status(404).json({ error: 'player_not_found', telegram_id: rec.tid });
+  console.log("🔑 token login:", rec.tid, player.player_id);
+  res.json({ isNew: false, user: sanitizePlayer(player) });
+});
+
 app.get('/api/debug/webhook', async (req, res) => {
   const out = { updates_received: webhookHits, last_update_at: lastWebhookAt || null };
   if (BOT_TOKEN) {
@@ -417,6 +427,26 @@ async function createPlayer({ username, phone_number, telegram_id, referrer_id }
  * message with `contact` -> that's the ONLY reliable way to get a real phone.
  */
 const seenUpdateIds = new Set();
+
+// ---- LOGIN TOKENS -------------------------------------------------------
+// Some Telegram clients open Mini Apps without populating initData. A token
+// minted server-side and delivered ONLY into that user's private chat is a
+// safe fallback: unguessable, and bound to a single telegram_id.
+const loginTokens = new Map();   // token -> { tid, created }
+const tidToToken = new Map();    // tid   -> token
+function mintLoginToken(tid) {
+  tid = String(tid);
+  const existing = tidToToken.get(tid);
+  if (existing) return existing;
+  const tok = crypto.randomBytes(24).toString('hex');
+  loginTokens.set(tok, { tid, created: Date.now() });
+  tidToToken.set(tid, tok);
+  return tok;
+}
+function playUrl(tid) {
+  const base = WEBAPP_URL.replace(/\/+$/, '');
+  return base + '/?tgauth=' + mintLoginToken(tid);
+}
 let webhookHits = 0;
 let lastWebhookAt = null;
 
@@ -448,6 +478,8 @@ const T = {
     "(Welcome to Fast Bingo!) 🎉\n\n" +
     "እባክዎ ከታች ካሉት አማራጮች ውስጥ ይምረጡ:",
   openApp: "🎮 መተግበሪያውን ለመክፈት ከታች ይጫኑ።",
+  deposit: "🏦 ገንዘብ ለማስገባት\n\nበቴሌብር ወይም በባንክ ከከፈሉ በኋላ የክፍያ ደረሰኝ ቁጥሩን በመተግበሪያው ውስጥ ያስገቡ።",
+  withdraw: "💵 ገንዘብ ለማውጣት\n\nዝቅተኛ የማውጫ መጠን 100 ብር ነው። ከዋና ሂሳብዎ ብቻ ማውጣት ይችላሉ።",
   balance: "💰 የእርስዎ ሂሳብ\n\n🏦 ዋና: <b>{main} ብር</b>\n🎁 ቦነስ: <b>{play} ብር</b>\n────────\n💵 ድምር: <b>{total} ብር</b>",
   notRegistered: "⚠️ እባክዎ መጀመሪያ /start ይጫኑ።",
   howTo:
@@ -464,12 +496,12 @@ const T = {
     "በዚህ ሊንክ የገባ ሰው ሲጫወት ቦነስ ያገኛሉ!",
 };
 
-function mainMenuKeyboard() {
+function mainMenuKeyboard(forTid) {
   // Reply keyboard under the message box. "Play Game" is a web_app button so it
   // passes signed initData; a plain url button would NOT.
   return {
     keyboard: [
-      [{ text: "🎮 Play Game (ክፈት)", web_app: { url: WEBAPP_URL } }],
+      [{ text: "🎮 Play Game (ክፈት)", web_app: { url: playUrl(forTid) } }],
       [{ text: "🏦 Add Funds (ገንዘብ አስገባ)" }, { text: "💵 Cash Out (ወጪ)" }],
       [{ text: "📊 My Balance (ቀሪ ሂሳብ)" }, { text: "🤝 Refer & Earn (ጋብዝ)" }],
       [{ text: "📜 How to Play (መመሪያ)" }, { text: "🎧 Support (እገዛ)" }]
@@ -527,7 +559,7 @@ async function sendGroupOffer(chat_id, player) {
 }
 
 async function finishOnboarding(chat_id, tid) {
-  await tgSend(chat_id, T.menuTitle, mainMenuKeyboard());
+  await tgSend(chat_id, T.menuTitle, mainMenuKeyboard(tid));
 }
 
 app.post('/api/telegram/webhook', async (req, res) => {
@@ -620,8 +652,9 @@ async function handleMenuText(chatId, tid, text) {
       .replace('{play}', String(sp.play_balance))
       .replace('{total}', String(sp.balance)));
   } else if (text.includes('Add Funds') || text.includes('Cash Out') || text.includes('\u1308\u1295\u12d8\u1265') || text.includes('\u12c8\u132a')) {
-    await tgSend(chatId, T.menuReady, {
-      inline_keyboard: [[{ text: "\ud83d\udcb3 Open Wallet", web_app: { url: WEBAPP_URL } }]]
+    const isDeposit = text.includes('Add Funds') || text.includes('\u1308\u1295\u12d8\u1265');
+    await tgSend(chatId, (isDeposit ? T.deposit : T.withdraw) + "\n\n" + T.openApp, {
+      inline_keyboard: [[{ text: isDeposit ? "\ud83c\udfe6 Add Funds" : "\ud83d\udcb5 Cash Out", web_app: { url: playUrl(tid) } }]]
     });
   } else if (text.includes('Refer') || text.includes('\u130b\u1265\u12dd') || text === '/refer') {
     const link = BOT_USERNAME_ENV
@@ -668,9 +701,10 @@ async function handleCallback(cb) {
     }
 
     const member = await isGroupMember(tid);
-    // null = group not configured / bot not admin -> trust the user rather than
-    // block onboarding entirely.
-    if (member === false) {
+    // Fail CLOSED: only pay when membership is positively confirmed. `null`
+    // means the check itself failed (bot not admin / wrong id) - paying then
+    // would let anyone claim the bonus without joining.
+    if (member !== true && TG_GROUP_ID) {
       await answer('');
       await tgSend(chatId, T.groupNotJoined, groupOfferKeyboard());
       return;

@@ -71,6 +71,10 @@ if (/^\d+$/.test(TG_GROUP_ID)) {
 const TG_GROUP_ID_OK = !TG_GROUP_ID || /^(-100\d+|@[\w]+)$/.test(TG_GROUP_ID);
 const BOT_USERNAME_ENV = (process.env.BOT_USERNAME || '').trim().replace(/^@/, '');
 const SUPPORT_CONTACT = (process.env.SUPPORT_CONTACT || '@YourSupport').trim();
+const ADMIN_ID = (process.env.ADMIN_ID || '').trim();          // your telegram id
+const TELEBIRR_NUMBER = (process.env.TELEBIRR_NUMBER || '').trim();
+const CBE_NUMBER = (process.env.CBE_NUMBER || '').trim();
+const MIN_DEPOSIT_AMOUNT = Number(process.env.MIN_DEPOSIT_AMOUNT) || 50;
 const CARD_PRICE = Number(process.env.CARD_PRICE) || 10;
 const PAYOUT_PERCENTAGE = Number(process.env.PAYOUT_PERCENTAGE) || 0.8;
 const MIN_PLAYERS_TO_START = Number(process.env.MIN_PLAYERS_TO_START) || 2;
@@ -478,6 +482,26 @@ const T = {
     "(Welcome to Fast Bingo!) 🎉\n\n" +
     "እባክዎ ከታች ካሉት አማራጮች ውስጥ ይምረጡ:",
   openApp: "🎮 መተግበሪያውን ለመክፈት ከታች ይጫኑ።",
+  depAsk: "💳 ገንዘብ ማስገባት\n\nምን ያህል ማስገባት ይፈልጋሉ? (ዝቅተኛ {min} ብር)\n\nመጠኑን በቁጥር ይጻፉ:",
+  depMin: "❌ ዝቅተኛው {min} ብር ነው። እንደገና ይሞክሩ:",
+  depBadNum: "❌ ትክክለኛ ቁጥር ያስገቡ:",
+  depMethod: "የ<b>{amt} ብር</b> ክፍያ መንገድ ይምረጡ:",
+  depInstr:
+    "💰 <b>{method}</b>\n\n💳 መጠን: <b>{amt} ብር</b>\n🏦 ሂሳብ ቁጥር: <code>{acct}</code>\n\n" +
+    "<b>ደረጃዎች:</b>\n1. ከላይ ወዳለው ሂሳብ {amt} ብር ይላኩ\n2. የማረጋገጫ ኤስኤምኤስ ይደርስዎታል\n" +
+    "3. ያንን ኤስኤምኤስ ኮፒ አድርገው እዚህ ይለጥፉ\n\nኤስኤምኤሱን አሁን ይለጥፉ:",
+  depDone: "✅ <b>ጥያቄዎ ደርሶናል!</b>\n\nመጠን: <b>{amt} ብር</b>\nሁኔታ: ⏳ በመጠባበቅ ላይ\n\nከተረጋገጠ በኋላ ወደ ሂሳብዎ ይገባል።",
+  depApproved: "✅ <b>ተቀባይነት አግኝቷል!</b>\n\nመጠን: <b>{amt} ብር</b>\nአዲስ ቀሪ ሂሳብ: <b>{bal} ብር</b>\n\nመልካም ጨዋታ! 🎮",
+  depRejected: "❌ <b>ተቀባይነት አላገኘም</b>\n\nመጠን: <b>{amt} ብር</b>\n\nለበለጠ መረጃ ድጋፍን ያግኙ።",
+  wdAsk: "📤 ገንዘብ ማውጣት\n\n💰 የሚወጣ ቀሪ ሂሳብ: <b>{bal} ብር</b>\nዝቅተኛ: {min} ብር\n\nመጠኑን ይጻፉ:",
+  wdMin: "❌ ዝቅተኛው {min} ብር ነው:",
+  wdNoFunds: "❌ በቂ ሂሳብ የለዎትም። የሚወጣ: {bal} ብር\n\n(የቦነስ ገንዘብ ማውጣት አይቻልም)",
+  wdPhone: "የቴሌብር ስልክ ቁጥርዎን ያስገቡ:",
+  wdDone: "✅ <b>ጥያቄዎ ገብቷል!</b>\n\nመጠን: <b>{amt} ብር</b>\nስልክ: {phone}\n\nበ1-2 ሰዓት ውስጥ ይላካል።",
+  txnsEmpty: "ገና ምንም ግብይት የለም።",
+  txnsTitle: "📋 <b>የመጨረሻዎቹ ግብይቶች</b>\n\n",
+  cancelled: "ተሰርዟል።",
+  btnCancel: "❌ ተመለስ",
   deposit: "🏦 ገንዘብ ለማስገባት\n\nበቴሌብር ወይም በባንክ ከከፈሉ በኋላ የክፍያ ደረሰኝ ቁጥሩን በመተግበሪያው ውስጥ ያስገቡ።",
   withdraw: "💵 ገንዘብ ለማውጣት\n\nዝቅተኛ የማውጫ መጠን 100 ብር ነው። ከዋና ሂሳብዎ ብቻ ማውጣት ይችላሉ።",
   balance: "💰 የእርስዎ ሂሳብ\n\n🏦 ዋና: <b>{main} ብር</b>\n🎁 ቦነስ: <b>{play} ብር</b>\n────────\n💵 ድምር: <b>{total} ብር</b>",
@@ -504,7 +528,8 @@ function mainMenuKeyboard(forTid) {
       [{ text: "🎮 Play Game (ክፈት)", web_app: { url: playUrl(forTid) } }],
       [{ text: "🏦 Add Funds (ገንዘብ አስገባ)" }, { text: "💵 Cash Out (ወጪ)" }],
       [{ text: "📊 My Balance (ቀሪ ሂሳብ)" }, { text: "🤝 Refer & Earn (ጋብዝ)" }],
-      [{ text: "📜 How to Play (መመሪያ)" }, { text: "🎧 Support (እገዛ)" }]
+      [{ text: "📋 Transactions (ግብይቶች)" }, { text: "📜 How to Play (መመሪያ)" }],
+      [{ text: "🎧 Support (እገዛ)" }]
     ],
     resize_keyboard: true
   };
@@ -635,10 +660,161 @@ app.post('/api/telegram/webhook', async (req, res) => {
       return;
     }
 
+    // ---- ADMIN COMMANDS ----
+    if (ADMIN_ID && String(tid) === String(ADMIN_ID)) {
+      const m = text.match(/^\/(approve|reject)_(\d+)$/);
+      if (m) { await handleAdminDeposit(chatId, m[1], Number(m[2])); return; }
+      if (text === '/pending') { await listPending(chatId); return; }
+    }
+
+    // ---- ACTIVE WIZARD? ----
+    const convPlayer = await findPlayerByTelegramId(tid);
+    if (convPlayer && await handleConversation(chatId, tid, text, convPlayer)) return;
+
     // ---- MENU BUTTONS ----
     await handleMenuText(chatId, tid, text);
   } catch (e) { console.error("webhook error", e.message); }
 });
+
+
+// ---- BOT CONVERSATION STATE (deposit / withdraw wizards) ----
+const convState = new Map();   // tid -> { step, data }
+function setConv(tid, step, data) { convState.set(String(tid), { step, data: data || {} }); }
+function getConv(tid) { return convState.get(String(tid)) || null; }
+function clearConv(tid) { convState.delete(String(tid)); }
+
+const pendingDeposits = new Map();  // id -> record
+let depositSeq = Date.now() % 100000;
+
+function cancelKb() { return { keyboard: [[{ text: T.btnCancel }]], resize_keyboard: true }; }
+
+async function notifyAdmin(text) {
+  if (!ADMIN_ID) { console.warn("⚠️ ADMIN_ID not set - cannot notify admin"); return; }
+  await tgSend(ADMIN_ID, text);
+}
+
+// Returns true if the message was consumed by an active wizard.
+async function handleConversation(chatId, tid, text, player) {
+  const st = getConv(tid);
+  if (!st) return false;
+
+  if (text === T.btnCancel || text === '/cancel') {
+    clearConv(tid);
+    await tgSend(chatId, T.cancelled, mainMenuKeyboard(tid));
+    return true;
+  }
+
+  const sp = sanitizePlayer(player);
+
+  // ----- DEPOSIT -----
+  if (st.step === 'dep_amount') {
+    const amt = Number(String(text).replace(/[^\d.]/g, ''));
+    if (!amt || isNaN(amt)) { await tgSend(chatId, T.depBadNum); return true; }
+    if (amt < MIN_DEPOSIT_AMOUNT) {
+      await tgSend(chatId, T.depMin.replace('{min}', String(MIN_DEPOSIT_AMOUNT)));
+      return true;
+    }
+    setConv(tid, 'dep_method', { amount: amt });
+    const rows = [];
+    if (TELEBIRR_NUMBER) rows.push([{ text: "📱 TeleBirr", callback_data: "dep_telebirr" }]);
+    if (CBE_NUMBER) rows.push([{ text: "🏦 CBE Birr", callback_data: "dep_cbe" }]);
+    rows.push([{ text: T.btnCancel, callback_data: "dep_cancel" }]);
+    await tgSend(chatId, T.depMethod.replace('{amt}', String(amt)), { inline_keyboard: rows });
+    return true;
+  }
+
+  if (st.step === 'dep_sms') {
+    const { amount, method } = st.data;
+    const id = ++depositSeq;
+    const rec = {
+      id, player_id: player.player_id, telegram_id: String(tid), chat_id: chatId,
+      amount, method, sms: String(text).slice(0, 800),
+      status: 'pending', created_at: new Date().toISOString()
+    };
+    pendingDeposits.set(id, rec);
+    if (supabase) {
+      try { await supabase.from('deposit_requests').insert([{
+        player_id: rec.player_id, method, amount, reference_id: String(id),
+        status: 'pending', requested_at: rec.created_at
+      }]); } catch (e) {}
+    }
+    clearConv(tid);
+    await tgSend(chatId, T.depDone.replace('{amt}', String(amount)), mainMenuKeyboard(tid));
+    await notifyAdmin(
+      `🔔 <b>New Deposit</b>\n\nUser: ${player.username}\nTG: <code>${tid}</code>\n` +
+      `Amount: <b>${amount} ETB</b>\nMethod: ${method}\nRef: <code>${id}</code>\n\n` +
+      `SMS:\n<code>${String(text).slice(0, 400)}</code>\n\n` +
+      `✅ /approve_${id}\n❌ /reject_${id}`);
+    return true;
+  }
+
+  // ----- WITHDRAW -----
+  if (st.step === 'wd_amount') {
+    const amt = Number(String(text).replace(/[^\d.]/g, ''));
+    if (!amt || isNaN(amt)) { await tgSend(chatId, T.depBadNum); return true; }
+    if (amt < MIN_WITHDRAWAL_AMOUNT) {
+      await tgSend(chatId, T.wdMin.replace('{min}', String(MIN_WITHDRAWAL_AMOUNT)));
+      return true;
+    }
+    if (amt > sp.main_balance) {
+      await tgSend(chatId, T.wdNoFunds.replace('{bal}', String(sp.main_balance)));
+      return true;
+    }
+    setConv(tid, 'wd_phone', { amount: amt });
+    await tgSend(chatId, T.wdPhone, cancelKb());
+    return true;
+  }
+
+  if (st.step === 'wd_phone') {
+    const { amount } = st.data;
+    const phone = String(text).trim();
+    const fresh = await findPlayerById(player.player_id);
+    const fsp = sanitizePlayer(fresh);
+    if (amount > fsp.main_balance) {
+      clearConv(tid);
+      await tgSend(chatId, T.wdNoFunds.replace('{bal}', String(fsp.main_balance)), mainMenuKeyboard(tid));
+      return true;
+    }
+    const balances = await creditPlayerBalances(player.player_id, {
+      mainAdd: -amount, type: 'withdrawal', notes: `Withdraw to ${phone}`
+    });
+    if (supabase) {
+      try { await supabase.from('withdrawal_requests').insert([{
+        player_id: player.player_id, amount, method: 'Telebirr', account_number: phone,
+        account_name: player.username || '', status: 'pending', requested_at: new Date().toISOString()
+      }]); } catch (e) {}
+    }
+    clearConv(tid);
+    await tgSend(chatId, T.wdDone.replace('{amt}', String(amount)).replace('{phone}', phone), mainMenuKeyboard(tid));
+    await notifyAdmin(
+      `🔔 <b>Withdrawal</b>\n\nUser: ${player.username}\nTG: <code>${tid}</code>\n` +
+      `Amount: <b>${amount} ETB</b>\nPhone: <code>${phone}</code>\n` +
+      `Remaining: ${balances ? balances.balance : '?'} ETB`);
+    return true;
+  }
+
+  return false;
+}
+
+async function sendTransactions(chatId, player) {
+  let rows = [];
+  if (supabase) {
+    try {
+      const { data } = await supabase.from('transactions')
+        .select('type, amount, notes, created_at')
+        .eq('player_id', player.player_id)
+        .order('created_at', { ascending: false }).limit(10);
+      rows = data || [];
+    } catch (e) {}
+  }
+  if (!rows.length) { await tgSend(chatId, T.txnsEmpty); return; }
+  let out = T.txnsTitle;
+  for (const t of rows) {
+    const amt = Number(t.amount) || 0;
+    out += `${amt >= 0 ? '⬆️' : '⬇️'} <b>${Math.abs(amt)} ETB</b> — ${t.notes || t.type}\n`;
+  }
+  await tgSend(chatId, out);
+}
 
 async function handleMenuText(chatId, tid, text) {
   if (!text) return;
@@ -651,11 +827,16 @@ async function handleMenuText(chatId, tid, text) {
       .replace('{main}', String(sp.main_balance))
       .replace('{play}', String(sp.play_balance))
       .replace('{total}', String(sp.balance)));
-  } else if (text.includes('Add Funds') || text.includes('Cash Out') || text.includes('\u1308\u1295\u12d8\u1265') || text.includes('\u12c8\u132a')) {
-    const isDeposit = text.includes('Add Funds') || text.includes('\u1308\u1295\u12d8\u1265');
-    await tgSend(chatId, (isDeposit ? T.deposit : T.withdraw) + "\n\n" + T.openApp, {
-      inline_keyboard: [[{ text: isDeposit ? "\ud83c\udfe6 Add Funds" : "\ud83d\udcb5 Cash Out", web_app: { url: playUrl(tid) } }]]
-    });
+  } else if (text.includes('Add Funds') || text.includes('\u1308\u1295\u12d8\u1265') || text === '/deposit') {
+    setConv(tid, 'dep_amount', {});
+    await tgSend(chatId, T.depAsk.replace('{min}', String(MIN_DEPOSIT_AMOUNT)), cancelKb());
+  } else if (text.includes('Cash Out') || text.includes('\u12c8\u132a') || text === '/withdraw') {
+    setConv(tid, 'wd_amount', {});
+    await tgSend(chatId, T.wdAsk
+      .replace('{bal}', String(sp.main_balance))
+      .replace('{min}', String(MIN_WITHDRAWAL_AMOUNT)), cancelKb());
+  } else if (text.includes('Transactions') || text.includes('\u130d\u1265\u12ed\u1276\u127d') || text === '/transactions') {
+    await sendTransactions(chatId, player);
   } else if (text.includes('Refer') || text.includes('\u130b\u1265\u12dd') || text === '/refer') {
     const link = BOT_USERNAME_ENV
       ? `https://t.me/${BOT_USERNAME_ENV}?start=ref_${player.player_id}`
@@ -666,6 +847,43 @@ async function handleMenuText(chatId, tid, text) {
   } else if (text.includes('Support') || text.includes('\u12a5\u1308\u12db')) {
     await tgSend(chatId, T.support.replace('{support}', SUPPORT_CONTACT));
   }
+}
+
+async function handleAdminDeposit(chatId, action, id) {
+  const rec = pendingDeposits.get(id);
+  if (!rec) { await tgSend(chatId, `❌ Deposit #${id} not found.`); return; }
+  if (rec.status !== 'pending') { await tgSend(chatId, `⚠️ #${id} already ${rec.status}.`); return; }
+
+  if (action === 'approve') {
+    const balances = await creditPlayerBalances(rec.player_id, {
+      mainAdd: rec.amount, type: 'deposit', notes: `Deposit ${rec.method} #${id}`
+    });
+    rec.status = 'approved';
+    if (supabase) {
+      try { await supabase.from('deposit_requests').update({ status: 'approved' }).eq('reference_id', String(id)); } catch (e) {}
+    }
+    await tgSend(rec.chat_id, T.depApproved
+      .replace('{amt}', String(rec.amount))
+      .replace('{bal}', String(balances ? balances.balance : rec.amount)));
+    await tgSend(chatId, `✅ Approved #${id} — ${rec.amount} ETB credited.`);
+  } else {
+    rec.status = 'rejected';
+    if (supabase) {
+      try { await supabase.from('deposit_requests').update({ status: 'rejected' }).eq('reference_id', String(id)); } catch (e) {}
+    }
+    await tgSend(rec.chat_id, T.depRejected.replace('{amt}', String(rec.amount)));
+    await tgSend(chatId, `❌ Rejected #${id}.`);
+  }
+}
+
+async function listPending(chatId) {
+  const list = Array.from(pendingDeposits.values()).filter(d => d.status === 'pending');
+  if (!list.length) { await tgSend(chatId, "No pending deposits."); return; }
+  let out = "📋 <b>Pending Deposits</b>\n\n";
+  for (const d of list) {
+    out += `<code>${d.id}</code> — ${d.amount} ETB — ${d.method}\n/approve_${d.id}  /reject_${d.id}\n\n`;
+  }
+  await tgSend(chatId, out);
 }
 
 async function handleCallback(cb) {
@@ -682,6 +900,26 @@ async function handleCallback(cb) {
       });
     } catch (e) {}
   };
+
+  if (data.startsWith('dep_')) {
+    const st = getConv(tid);
+    if (data === 'dep_cancel') {
+      clearConv(tid); await answer('');
+      await tgSend(chatId, T.cancelled, mainMenuKeyboard(tid));
+      return;
+    }
+    if (!st || st.step !== 'dep_method') { await answer(''); return; }
+    const isTb = data === 'dep_telebirr';
+    const method = isTb ? 'TeleBirr' : 'CBE Birr';
+    const acct = isTb ? TELEBIRR_NUMBER : CBE_NUMBER;
+    setConv(tid, 'dep_sms', { amount: st.data.amount, method });
+    await answer('');
+    await tgSend(chatId, T.depInstr
+      .replace(/{method}/g, method)
+      .replace(/{amt}/g, String(st.data.amount))
+      .replace('{acct}', acct));
+    return;
+  }
 
   if (data === 'skip_group') {
     await answer('');

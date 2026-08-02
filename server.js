@@ -77,10 +77,14 @@ const CBE_NUMBER = (process.env.CBE_NUMBER || '').trim();
 const MIN_DEPOSIT_AMOUNT = Number(process.env.MIN_DEPOSIT_AMOUNT) || 50;
 const CARD_PRICE = Number(process.env.CARD_PRICE) || 10;
 const PAYOUT_PERCENTAGE = Number(process.env.PAYOUT_PERCENTAGE) || 0.8;
+// House keeps a flat fee per card; the rest goes to the winner(s).
+// 10 ETB card - 2 ETB house = 8 ETB per card into the prize pool.
+const HOUSE_FEE_PER_CARD = Number(process.env.HOUSE_FEE_PER_CARD) || 2;
 const MIN_PLAYERS_TO_START = Number(process.env.MIN_PLAYERS_TO_START) || 2;
 const INITIAL_WAIT_SECONDS = Number(process.env.INITIAL_WAIT_SECONDS) || 40;
 const RECHECK_WAIT_SECONDS = Number(process.env.RECHECK_WAIT_SECONDS) || 40;
 const POST_ROUND_PAUSE_SECONDS = Number(process.env.POST_ROUND_PAUSE_SECONDS) || 15;
+const WINNER_DISPLAY_SECONDS = Number(process.env.WINNER_DISPLAY_SECONDS) || 5;
 const MIN_WITHDRAWAL_AMOUNT = Number(process.env.MIN_WITHDRAWAL_AMOUNT) || 100;
 const SIGNUP_BONUS = 10;
 const TG_GROUP_BONUS = 10;
@@ -88,9 +92,12 @@ const TG_GROUP_BONUS = 10;
 // ============ LOCAL PERSISTENCE (survives restarts) ============
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PLAYERS_FILE = path.join(DATA_DIR, 'players.json');
+const TOKENS_FILE = path.join(DATA_DIR, 'tokens.json');
 const PHONES_FILE = path.join(DATA_DIR, 'phones.json');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 
+const loginTokens = new Map();   // token -> { tid, created }
+const tidToToken = new Map();    // tid   -> token
 const inMemoryPlayers = new Map();        // player_id -> player
 const inMemoryPhoneToId = new Map();      // phone -> player_id
 const inMemoryTgToId = new Map();         // telegram_id -> player_id
@@ -110,6 +117,13 @@ function loadDisk() {
     const raw = JSON.parse(fs.readFileSync(PHONES_FILE, 'utf8'));
     Object.entries(raw || {}).forEach(([k, v]) => tgPhoneBook.set(String(k), v));
   } catch (e) {}
+  try {
+    const raw = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
+    Object.entries(raw || {}).forEach(([tok, tid]) => {
+      loginTokens.set(tok, { tid: String(tid), created: 0 });
+      tidToToken.set(String(tid), tok);
+    });
+  } catch (e) {}
 }
 let flushTimer = null;
 function flushDisk() {
@@ -118,6 +132,11 @@ function flushDisk() {
     flushTimer = null;
     try { fs.writeFileSync(PLAYERS_FILE, JSON.stringify(Array.from(inMemoryPlayers.values()))); } catch (e) {}
     try { fs.writeFileSync(PHONES_FILE, JSON.stringify(Object.fromEntries(tgPhoneBook))); } catch (e) {}
+    try {
+      const t = {};
+      loginTokens.forEach((v, k) => { t[k] = v.tid; });
+      fs.writeFileSync(TOKENS_FILE, JSON.stringify(t));
+    } catch (e) {}
   }, 400);
 }
 loadDisk();
@@ -207,7 +226,8 @@ async function findPlayerByTelegramId(telegram_id) {
   const tid = String(telegram_id);
   if (supabase) {
     try {
-      const { data } = await supabase.from('players').select('*').eq('telegram_id', tid).maybeSingle();
+      const { data, error } = await supabase.from('players').select('*').eq('telegram_id', tid).maybeSingle();
+      if (error) console.error("❌ supabase read (telegram_id):", error.message);
       if (data) { cachePlayer(data); return data; }
     } catch (e) {}
   }
@@ -247,10 +267,20 @@ async function savePlayer(playerObj) {
   cachePlayer(playerObj);
   if (!supabase) return playerObj;
   try {
-    const { data } = await supabase.from('players').upsert([playerObj], { onConflict: 'player_id' }).select().maybeSingle();
+    const { data, error } = await supabase.from('players')
+      .upsert([playerObj], { onConflict: 'player_id' }).select().maybeSingle();
+    if (error) {
+      // Was silent before - a schema mismatch here meant NOTHING persisted and
+      // every app open looked like a brand new user.
+      console.error("❌ SUPABASE SAVE FAILED:", error.message, "|", error.details || '', "|", error.hint || '');
+      console.error("   player keys:", Object.keys(playerObj).join(','));
+      return playerObj;
+    }
     if (data) cachePlayer(data);
     return data || playerObj;
-  } catch (err) {}
+  } catch (err) {
+    console.error("❌ SUPABASE SAVE THREW:", err.message);
+  }
   return playerObj;
 }
 
@@ -436,8 +466,6 @@ const seenUpdateIds = new Set();
 // Some Telegram clients open Mini Apps without populating initData. A token
 // minted server-side and delivered ONLY into that user's private chat is a
 // safe fallback: unguessable, and bound to a single telegram_id.
-const loginTokens = new Map();   // token -> { tid, created }
-const tidToToken = new Map();    // tid   -> token
 function mintLoginToken(tid) {
   tid = String(tid);
   const existing = tidToToken.get(tid);
@@ -445,6 +473,7 @@ function mintLoginToken(tid) {
   const tok = crypto.randomBytes(24).toString('hex');
   loginTokens.set(tok, { tid, created: Date.now() });
   tidToToken.set(tid, tok);
+  flushDisk();
   return tok;
 }
 function playUrl(tid) {
@@ -1322,12 +1351,19 @@ let gameBallInterval = null;
 let currentRoundWinners = [];
 
 function tickPayload() {
+  const parts = participantsOf(currentActiveGameRoundId);
+  const totalCards = Array.from(parts.values())
+    .reduce((s, p) => s + (Number(p.purchased_cards) || 0), 0);
   return {
     gameId: currentActiveGameRoundId,
     state: globalGameState,
     timeRemaining,
     drawnHistory: drawnBallsHistory,
-    participantCount: participantsOf(currentActiveGameRoundId).size,
+    participantCount: parts.size,
+    totalCards,
+    // Live prize pool so the client can render "Derash" without guessing.
+    derash: totalCards * (CARD_PRICE - HOUSE_FEE_PER_CARD),
+    cardPrice: CARD_PRICE,
     minPlayersToStart: MIN_PLAYERS_TO_START,
     serverTime: Date.now()
   };
@@ -1375,6 +1411,24 @@ function startBallDrawing() {
   }, 3000);
 }
 
+// Returns the [col,row] pairs of the first completed line, for highlighting.
+function winningLineCells(cardNum, drawn) {
+  try {
+    const c = genCard(cardNum);
+    const hit = (col, row) => c[col][row] === 0 || drawn.includes(c[col][row]);
+    for (let r = 0; r < 5; r++) {
+      if ([0,1,2,3,4].every(i => hit(i, r))) return [0,1,2,3,4].map(i => [i, r]);
+    }
+    for (let col = 0; col < 5; col++) {
+      if ([0,1,2,3,4].every(i => hit(col, i))) return [0,1,2,3,4].map(i => [col, i]);
+    }
+    if ([0,1,2,3,4].every(i => hit(i, i))) return [0,1,2,3,4].map(i => [i, i]);
+    if ([0,1,2,3,4].every(i => hit(4 - i, i))) return [0,1,2,3,4].map(i => [4 - i, i]);
+    if (hit(0,0) && hit(4,0) && hit(0,4) && hit(4,4)) return [[0,0],[4,0],[0,4],[4,4]];
+  } catch (e) {}
+  return [];
+}
+
 async function resolveRoundWinners() {
   if (gameBallInterval) clearInterval(gameBallInterval);
   globalGameState = "waiting";
@@ -1382,7 +1436,7 @@ async function resolveRoundWinners() {
 
   if (currentRoundWinners.length === 0) { startNewRound(); return; }
 
-  const payout = Math.floor((currentRoundPot * PAYOUT_PERCENTAGE) / currentRoundWinners.length);
+  const payout = Math.floor(currentRoundPot / currentRoundWinners.length);
   for (const winner of currentRoundWinners) {
     await creditPlayerBalances(winner.player_id, { mainAdd: payout, type: 'payout', game_id: currentActiveGameRoundId, notes: `Bingo! Card #${winner.cardNum}` });
     if (supabase) {
@@ -1397,8 +1451,14 @@ async function resolveRoundWinners() {
     cardNum: currentRoundWinners[0].cardNum,
     winnerPlayerId: currentRoundWinners[0].player_id,
     payoutAmount: payout,
-    isSplit: currentRoundWinners.length > 1
+    isSplit: currentRoundWinners.length > 1,
+    drawnHistory: drawnBallsHistory,
+    winningCells: winningLineCells(Number(currentRoundWinners[0].cardNum), drawnBallsHistory),
+    displaySeconds: WINNER_DISPLAY_SECONDS
   });
+
+  // Hold the winning cartela on screen before the next countdown starts.
+  await new Promise(r => setTimeout(r, WINNER_DISPLAY_SECONDS * 1000));
   startNewRound();
 }
 
@@ -1419,8 +1479,10 @@ setInterval(() => {
           console.log(`🎮 Starting game with ${count} players!`);
           globalGameState = "playing";
           resetBallPool();
-          currentRoundPot = Array.from(participantsOf(currentActiveGameRoundId).values())
-            .reduce((s, p) => s + (Number(p.purchased_cards) || 0), 0) * CARD_PRICE;
+          const totalCards = Array.from(participantsOf(currentActiveGameRoundId).values())
+            .reduce((s, p) => s + (Number(p.purchased_cards) || 0), 0);
+          currentRoundPot = totalCards * (CARD_PRICE - HOUSE_FEE_PER_CARD);
+          console.log(`💰 Pot: ${totalCards} cards x ${CARD_PRICE - HOUSE_FEE_PER_CARD} = ${currentRoundPot} ETB`);
           io.emit('game_started', tickPayload());
           startBallDrawing();
         }

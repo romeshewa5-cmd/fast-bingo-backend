@@ -106,7 +106,14 @@ const tgPhoneBook = new Map();            // telegram_id -> real phone shared wi
 function loadDisk() {
   try {
     const raw = JSON.parse(fs.readFileSync(PLAYERS_FILE, 'utf8'));
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     (raw || []).forEach(p => {
+      // Legacy "p_<ts>_<rand>" ids can never be written to a UUID column.
+      if (p.player_id && !UUID_RE.test(p.player_id)) {
+        const old = p.player_id;
+        p.player_id = crypto.randomUUID();
+        console.log(`\u267b\ufe0f migrated legacy player id ${old} -> ${p.player_id}`);
+      }
       inMemoryPlayers.set(p.player_id, p);
       if (p.phone_number) inMemoryPhoneToId.set(String(p.phone_number), p.player_id);
       if (p.telegram_id) inMemoryTgToId.set(String(p.telegram_id), p.player_id);
@@ -287,8 +294,10 @@ async function savePlayer(playerObj) {
 async function logTransaction({ player_id, type, amount, game_id, balance_after, notes }) {
   if (!supabase) return;
   try {
-    await supabase.from('transactions').insert([{ player_id, type, amount, game_id, balance_after, notes }]);
-  } catch (err) {}
+    const { error } = await supabase.from('transactions')
+      .insert([{ player_id, type, amount, game_id, balance_after, notes }]);
+    if (error) console.error("\u274c transactions insert failed:", error.message);
+  } catch (err) { console.error("\u274c transactions insert threw:", err.message); }
 }
 
 async function creditPlayerBalances(player_id, { mainAdd = 0, playAdd = 0, type, game_id, notes }) {
@@ -337,9 +346,13 @@ app.get('/api/debug/webhook', async (req, res) => {
   res.json(out);
 });
 
+// Bump this whenever server.js changes, so /api/health proves which build is live.
+const BUILD_ID = 'uuid-ids-2026-08-02';
+
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
+    build: BUILD_ID,
     timestamp: new Date().toISOString(),
     gameId: currentActiveGameRoundId,
     state: globalGameState,
@@ -432,7 +445,9 @@ async function createPlayer({ username, phone_number, telegram_id, referrer_id }
   if (existingByPhone) {
     return await savePlayer({ ...existingByPhone, telegram_id: telegram_id || existingByPhone.telegram_id, username });
   }
-  const playerId = `p_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+  // players.player_id is a UUID column in Supabase - a "p_<ts>_<rand>" string
+  // is rejected with: invalid input syntax for type uuid.
+  const playerId = crypto.randomUUID();
   const newPlayer = {
     player_id: playerId,
     username,
@@ -1135,10 +1150,11 @@ app.post('/api/games/create', async (req, res) => {
 
     if (supabase) {
       try {
-        await supabase.from('game_participants').insert([{
+        const { error } = await supabase.from('game_participants').insert([{
           player_id, game_id, purchased_cards: Number(cards_bought), is_winner: false, metadata: { cards: wanted }
         }]);
-      } catch (e) {}
+        if (error) console.error("\u274c game_participants insert failed:", error.message);
+      } catch (e) { console.error("\u274c game_participants insert threw:", e.message); }
     }
 
     broadcastTick();

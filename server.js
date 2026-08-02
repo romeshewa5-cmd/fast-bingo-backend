@@ -159,6 +159,7 @@ const submittedReferenceIds = new Set();
 // Round participants kept in memory so the game works WITHOUT supabase.
 // gameId -> Map(player_id -> { purchased_cards, cards, username })
 let warnedNoMetadata = false;
+const roundRowsCreated = new Set();
 const roundParticipants = new Map();
 function participantsOf(gameId) {
   if (!roundParticipants.has(gameId)) roundParticipants.set(gameId, new Map());
@@ -348,7 +349,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'autowin-fix-2026-08-02';
+const BUILD_ID = 'history+fk-2026-08-02';
 
 app.get('/api/health', (req, res) => {
   res.json({
@@ -1151,6 +1152,7 @@ app.post('/api/games/create', async (req, res) => {
 
     if (supabase) {
       try {
+        await ensureRoundRow(game_id);   // parent row must exist first
         const base = { player_id, game_id, purchased_cards: Number(cards_bought), is_winner: false };
         let { error } = await supabase.from('game_participants')
           .insert([{ ...base, metadata: { cards: wanted } }]);
@@ -1179,11 +1181,52 @@ app.post('/api/games/create', async (req, res) => {
 });
 
 app.get('/api/history/:player_id', async (req, res) => {
+  const pid = req.params.player_id;
   if (!supabase) return res.json([]);
+  const items = [];
   try {
-    const { data } = await supabase.from('game_participants').select('game_id, purchased_cards, is_winner').eq('player_id', req.params.player_id);
-    res.json(data || []);
-  } catch (err) { res.json([]); }
+    // transactions carries everything: entry fees, payouts, bonuses, deposits.
+    const { data: txns, error } = await supabase.from('transactions')
+      .select('type, amount, game_id, balance_after, notes, created_at')
+      .eq('player_id', pid).order('created_at', { ascending: false }).limit(60);
+    if (error) console.error("\u274c history transactions:", error.message);
+    (txns || []).forEach(t => {
+      const amt = Number(t.amount) || 0;
+      let kind = 'wallet', label = t.notes || t.type;
+      if (t.type === 'entry_fee') { kind = 'game'; label = 'You played'; }
+      else if (t.type === 'payout') { kind = 'game'; label = 'You won'; }
+      else if (t.type === 'deposit') label = 'Deposit';
+      else if (t.type === 'withdrawal') label = 'Withdrawal';
+      else if (String(t.type).includes('bonus')) label = 'Bonus';
+      items.push({
+        kind, type: t.type, label, amount: amt, game_id: t.game_id || null,
+        balance_after: t.balance_after ?? null, at: t.created_at, status: 'success'
+      });
+    });
+  } catch (e) { console.error("\u274c history threw:", e.message); }
+
+  // Pending money movements aren't in transactions until approved.
+  try {
+    const { data: deps } = await supabase.from('deposit_requests')
+      .select('amount, method, status, requested_at').eq('player_id', pid)
+      .order('requested_at', { ascending: false }).limit(20);
+    (deps || []).filter(d => d.status === 'pending').forEach(d => items.push({
+      kind: 'wallet', type: 'deposit', label: 'Deposit', amount: Number(d.amount) || 0,
+      method: d.method, status: d.status, at: d.requested_at
+    }));
+  } catch (e) {}
+  try {
+    const { data: wds } = await supabase.from('withdrawal_requests')
+      .select('amount, method, status, requested_at').eq('player_id', pid)
+      .order('requested_at', { ascending: false }).limit(20);
+    (wds || []).forEach(w => items.push({
+      kind: 'wallet', type: 'withdrawal', label: 'Withdrawal',
+      amount: -(Number(w.amount) || 0), method: w.method, status: w.status, at: w.requested_at
+    }));
+  } catch (e) {}
+
+  items.sort((a, b) => new Date(b.at || 0) - new Date(a.at || 0));
+  res.json(items.slice(0, 60));
 });
 
 app.get('/api/leaderboard', async (req, res) => {
@@ -1405,6 +1448,17 @@ function resetBallPool() {
   for (let i = 1; i <= 75; i++) ballPool.push(i);
 }
 
+async function ensureRoundRow(gameId) {
+  if (!supabase || !gameId) return;
+  if (roundRowsCreated.has(gameId)) return;
+  try {
+    const { error } = await supabase.from('rounds')
+      .upsert([{ game_id: gameId, state: 'waiting' }], { onConflict: 'game_id' });
+    if (error) console.error("\u274c rounds upsert failed:", error.message);
+    else roundRowsCreated.add(gameId);
+  } catch (e) { console.error("\u274c rounds upsert threw:", e.message); }
+}
+
 function startNewRound() {
   if (currentActiveGameRoundId) roundParticipants.delete(currentActiveGameRoundId);
   currentActiveGameRoundId = generateRoundId();
@@ -1415,9 +1469,10 @@ function startNewRound() {
   currentRoundWinners = [];
   participantsOf(currentActiveGameRoundId);
   console.log("🆕 New round:", currentActiveGameRoundId);
-  if (supabase) {
-    supabase.from('rounds').insert([{ game_id: currentActiveGameRoundId, state: 'waiting' }]).then(() => {}, () => {});
-  }
+  // Create the parent row immediately - game_participants has a FK to rounds,
+  // so inserting a participant before this exists throws
+  // "violates foreign key constraint game_participants_game_id_fkey".
+  ensureRoundRow(currentActiveGameRoundId);
   io.emit('new_round', tickPayload());
   broadcastTick();
 }
@@ -1465,8 +1520,10 @@ async function resolveRoundWinners() {
   if (currentRoundWinners.length === 0) { startNewRound(); return; }
 
   const payout = Math.floor(currentRoundPot / currentRoundWinners.length);
+  const paid = {};
   for (const winner of currentRoundWinners) {
-    await creditPlayerBalances(winner.player_id, { mainAdd: payout, type: 'payout', game_id: currentActiveGameRoundId, notes: `Bingo! Card #${winner.cardNum}` });
+    const bal = await creditPlayerBalances(winner.player_id, { mainAdd: payout, type: 'payout', game_id: currentActiveGameRoundId, notes: `Bingo! Card #${winner.cardNum}` });
+    if (bal) paid[winner.player_id] = bal;
     if (supabase) {
       try {
         await supabase.from('game_participants').update({ is_winner: true })
@@ -1482,7 +1539,10 @@ async function resolveRoundWinners() {
     isSplit: currentRoundWinners.length > 1,
     drawnHistory: drawnBallsHistory,
     winningCells: winningLineCells(Number(currentRoundWinners[0].cardNum), drawnBallsHistory),
-    displaySeconds: WINNER_DISPLAY_SECONDS
+    displaySeconds: WINNER_DISPLAY_SECONDS,
+    // Authoritative post-payout balances, so the winner's wallet updates on the
+    // spot instead of only after re-opening the app.
+    balances: paid
   });
 
   // Hold the winning cartela on screen before the next countdown starts.

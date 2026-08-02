@@ -158,6 +158,7 @@ const submittedReferenceIds = new Set();
 
 // Round participants kept in memory so the game works WITHOUT supabase.
 // gameId -> Map(player_id -> { purchased_cards, cards, username })
+let warnedNoMetadata = false;
 const roundParticipants = new Map();
 function participantsOf(gameId) {
   if (!roundParticipants.has(gameId)) roundParticipants.set(gameId, new Map());
@@ -347,7 +348,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'uuid-ids-2026-08-02';
+const BUILD_ID = 'autowin-fix-2026-08-02';
 
 app.get('/api/health', (req, res) => {
   res.json({
@@ -1150,9 +1151,20 @@ app.post('/api/games/create', async (req, res) => {
 
     if (supabase) {
       try {
-        const { error } = await supabase.from('game_participants').insert([{
-          player_id, game_id, purchased_cards: Number(cards_bought), is_winner: false, metadata: { cards: wanted }
-        }]);
+        const base = { player_id, game_id, purchased_cards: Number(cards_bought), is_winner: false };
+        let { error } = await supabase.from('game_participants')
+          .insert([{ ...base, metadata: { cards: wanted } }]);
+        // Not every deployment has the optional `metadata` (jsonb) column.
+        // Fall back to the base row so the round still records correctly.
+        if (error && /metadata/i.test(error.message || '')) {
+          if (!warnedNoMetadata) {
+            warnedNoMetadata = true;
+            console.warn("\u26a0\ufe0f game_participants has no 'metadata' column - saving without card numbers.");
+            console.warn("   Add it in Supabase for cross-restart reconnect:");
+            console.warn("   ALTER TABLE game_participants ADD COLUMN metadata jsonb;");
+          }
+          ({ error } = await supabase.from('game_participants').insert([base]));
+        }
         if (error) console.error("\u274c game_participants insert failed:", error.message);
       } catch (e) { console.error("\u274c game_participants insert threw:", e.message); }
     }
@@ -1524,17 +1536,23 @@ io.on('connection', (socket) => {
   });
 
   socket.on('claim_bingo', async (data) => {
-    if (globalGameState !== "playing") return;
     const { player_id, cardNum } = data || {};
-    if (!player_id || !cardNum) return;
+    const reject = (why) => {
+      console.log("\u26d4 bingo claim rejected:", why, player_id || '?', 'card', cardNum || '?');
+      socket.emit('bingo_rejected', { reason: why });
+    };
+    if (globalGameState !== "playing") return reject('round_not_playing');
+    if (!player_id || !cardNum) return reject('missing_fields');
     if (currentRoundWinners.some(w => w.player_id === player_id)) return;
 
     const part = participantsOf(currentActiveGameRoundId).get(player_id);
-    if (!part || !(part.cards || []).map(Number).includes(Number(cardNum))) return;
-    if (!cardHasWinningLine(Number(cardNum), drawnBallsHistory)) return;
+    if (!part) return reject('not_in_round');
+    if (!(part.cards || []).map(Number).includes(Number(cardNum))) return reject('card_not_yours');
+    // Use the shared pattern check so client and server always agree.
+    if (!winningLineCells(Number(cardNum), drawnBallsHistory).length) return reject('no_winning_line');
 
     const player = await findPlayerById(player_id);
-    if (!player || player.is_banned) return;
+    if (!player || player.is_banned) return reject('player_invalid');
 
     currentRoundWinners.push({ player_id, username: player.username || 'Player', cardNum });
     console.log("🏆 Bingo:", player.username, "Card #", cardNum);

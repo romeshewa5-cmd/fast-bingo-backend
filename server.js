@@ -87,6 +87,7 @@ const POST_ROUND_PAUSE_SECONDS = Number(process.env.POST_ROUND_PAUSE_SECONDS) ||
 const WINNER_DISPLAY_SECONDS = Number(process.env.WINNER_DISPLAY_SECONDS) || 5;
 const MIN_WITHDRAWAL_AMOUNT = Number(process.env.MIN_WITHDRAWAL_AMOUNT) || 100;
 const SIGNUP_BONUS = 10;
+const REFERRAL_BONUS = Number(process.env.REFERRAL_BONUS) || 5;
 const TG_GROUP_BONUS = 10;
 
 // ============ LOCAL PERSISTENCE (survives restarts) ============
@@ -160,6 +161,9 @@ const submittedReferenceIds = new Set();
 // gameId -> Map(player_id -> { purchased_cards, cards, username })
 let warnedNoMetadata = false;
 const roundRowsCreated = new Set();
+// telegram_id -> referrer player_id, captured from "/start ref_<id>" and used
+// when the contact is finally shared (which is when the account is created).
+const pendingReferrers = new Map();
 const roundParticipants = new Map();
 function participantsOf(gameId) {
   if (!roundParticipants.has(gameId)) roundParticipants.set(gameId, new Map());
@@ -355,7 +359,17 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'stable-token-2026-08-02';
+const BUILD_ID = 'referrals-2026-08-03';
+
+// Public config so the webapp can build a correct referral link.
+app.get('/api/config', (req, res) => {
+  res.json({
+    bot_username: BOT_USERNAME_ENV || null,
+    referral_bonus: REFERRAL_BONUS,
+    card_price: CARD_PRICE,
+    house_fee: HOUSE_FEE_PER_CARD
+  });
+});
 
 app.get('/api/health', (req, res) => {
   res.json({
@@ -417,7 +431,9 @@ app.post('/api/auth/telegram', async (req, res) => {
       return res.json({ isNew: true, needs_phone: true, telegram_id, username, user: null });
     }
 
-    player = await createPlayer({ username, phone_number: knownPhone, telegram_id, referrer_id: referrer_id || verified.start_param });
+    player = await createPlayer({ username, phone_number: knownPhone, telegram_id, referrer_id: referrer_id || pendingReferrers.get(telegram_id) || cleanRef(verified.start_param) });
+    await payReferrer(player);
+    pendingReferrers.delete(telegram_id);
     res.json({ isNew: true, needs_phone: false, user: sanitizePlayer(player) });
   } catch (err) {
     console.error("❌ auth error:", err.message);
@@ -440,13 +456,51 @@ app.post('/api/auth/phone-status', async (req, res) => {
       || `tg_${tid}`;
     player = await createPlayer({
       username, phone_number: phone, telegram_id: tid,
-      referrer_id: (req.body || {}).referrer_id || verified.start_param
+      referrer_id: (req.body || {}).referrer_id || pendingReferrers.get(tid) || cleanRef(verified.start_param)
     });
+    await payReferrer(player);
+    pendingReferrers.delete(tid);
     return res.json({ has_phone: true, isNew: true, user: sanitizePlayer(player) });
   }
   if (!player.phone_number) player = await savePlayer({ ...player, phone_number: phone });
   res.json({ has_phone: true, isNew: false, user: sanitizePlayer(player) });
 });
+
+// Credit the inviter when their invitee completes registration.
+function cleanRef(v) {
+  if (!v) return null;
+  const t = String(v).trim();
+  return t.startsWith('ref_') ? t.slice(4) : t;
+}
+
+async function payReferrer(newPlayer) {
+  try {
+    const refId = newPlayer && newPlayer.referred_by;
+    if (!refId) return;
+    if (String(refId) === String(newPlayer.player_id)) return;   // no self-referral
+    const referrer = await findPlayerById(refId);
+    if (!referrer) { console.warn("\u26a0\ufe0f referrer not found:", refId); return; }
+
+    const balances = await creditPlayerBalances(referrer.player_id, {
+      playAdd: REFERRAL_BONUS,
+      type: 'referral_bonus',
+      notes: `Referred ${newPlayer.username || 'a friend'}`
+    });
+    await savePlayer({
+      ...referrer,
+      ...(balances || {}),
+      referrals_count: Number(referrer.referrals_count || 0) + 1,
+      referral_earnings: Number(referrer.referral_earnings || 0) + REFERRAL_BONUS
+    });
+    console.log(`\ud83e\udd1d referral paid: ${referrer.username} +${REFERRAL_BONUS} ETB`);
+
+    if (referrer.telegram_id) {
+      await tgSend(referrer.telegram_id, T.refEarned
+        .replace('{name}', newPlayer.username || 'A friend')
+        .replace('{bonus}', String(REFERRAL_BONUS)));
+    }
+  } catch (e) { console.error("\u274c payReferrer failed:", e.message); }
+}
 
 async function createPlayer({ username, phone_number, telegram_id, referrer_id }) {
   const existingByPhone = await findPlayerByPhone(phone_number);
@@ -528,6 +582,15 @@ const T = {
     "መለያዎን ለማረጋገጥ የስልክ ቁጥርዎን ያካፍሉ።\n" +
     "ወዲያውኑ 10 ብር የምዝገባ ቦነስ ያገኛሉ!",
   askPhone: "📱 የስልክ ቁጥሬን አጋራለሁ",
+  intro:
+    "🎉 እንኳን ወደ ፋስት ቢንጎ በደህና መጡ!\n" +
+    "(Welcome to Fast Bingo!)\n\n" +
+    "🎮 ይጫወቱ እና ትልቅ ገንዘብ ያሸንፉ!\n\n" +
+    "🎁 <b>ሲመዘገቡ 20 ብር ቦነስ</b>\n" +
+    "   • 10 ብር የምዝገባ ቦነስ\n" +
+    "   • 10 ብር የግሩፕ ቦነስ\n\n" +
+    "🤝 <b>ጓደኛ ሲጋብዙ 5 ብር</b> ለእያንዳንዱ ጓደኛ!\n\n" +
+    "ለመጀመር የስልክ ቁጥርዎን ያጋሩ 👇",
   phoneOk: "✅ ስልክ ቁጥርዎ ተረጋግጧል!\n🎁 10 ብር የምዝገባ ቦነስ ተከፍሎታል።",
   groupOffer:
     "🎁 ተጨማሪ 10 ብር ቦነስ ይፈልጋሉ?\n\n" +
@@ -583,8 +646,13 @@ const T = {
     "🏆 አሸናፊው ከጠቅላላ ገንዘቡ 80% ይወስዳል።",
   support: "🎧 እገዛ ይፈልጋሉ?\nበአድሚን ያግኙን: {support}",
   referral:
-    "🤝 ጓደኞችዎን ይጋብዙ\n\nየእርስዎ ሊንክ:\n{link}\n\n" +
-    "በዚህ ሊንክ የገባ ሰው ሲጫወት ቦነስ ያገኛሉ!",
+    "🤝 <b>ጓደኞችዎን ይጋብዙ እና ያትርፉ!</b>\n\n" +
+    "ለእያንዳንዱ የሚጋብዙት ጓደኛ <b>{bonus} ብር</b> ያገኛሉ።\n" +
+    "ጓደኛዎ ሲመዘገብ ወዲያውኑ ወደ ሂሳብዎ ይገባል።\n\n" +
+    "👥 እስካሁን የጋበዙት: <b>{count}</b>\n" +
+    "💰 ያገኙት: <b>{earned} ብር</b>\n\n" +
+    "የእርስዎ ሊንክ (ኮፒ አድርገው ያጋሩ):\n{link}",
+  refEarned: "🎉 <b>የሪፈራል ቦነስ!</b>\n\n{name} በእርስዎ ሊንክ ተመዝግቧል።\n💰 <b>+{bonus} ብር</b> ወደ ሂሳብዎ ገብቷል!",
 };
 
 function mainMenuKeyboard(forTid) {
@@ -689,8 +757,17 @@ app.post('/api/telegram/webhook', async (req, res) => {
       console.log("\ud83d\udcde Contact stored for", tid, phone);
 
       let player = await findPlayerByTelegramId(tid);
-      if (!player) player = await createPlayer({ username, phone_number: phone, telegram_id: tid });
-      else if (!player.phone_number) player = await savePlayer({ ...player, phone_number: phone });
+      const wasNew = !player;
+      if (!player) {
+        player = await createPlayer({
+          username, phone_number: phone, telegram_id: tid,
+          referrer_id: pendingReferrers.get(tid) || null
+        });
+      } else if (!player.phone_number) {
+        player = await savePlayer({ ...player, phone_number: phone });
+      }
+      if (wasNew) await payReferrer(player);
+      pendingReferrers.delete(tid);
 
       await tgSend(chatId, T.phoneOk, { remove_keyboard: true });
 
@@ -713,9 +790,19 @@ app.post('/api/telegram/webhook', async (req, res) => {
     }
 
     if (text.startsWith('/start')) {
+      // "/start ref_<player_id>" - capture who invited this user.
+      const payload = text.split(/\s+/)[1] || '';
+      if (payload.startsWith('ref_')) {
+        const refId = payload.slice(4);
+        if (refId) {
+          pendingReferrers.set(tid, refId);
+          console.log("\ud83e\udd1d referral captured:", tid, "invited by", refId);
+        }
+      }
+
       const player = await findPlayerByTelegramId(tid);
       if (!player || !tgPhoneBook.has(tid)) {
-        await tgSend(chatId, T.welcome, {
+        await tgSend(chatId, T.intro, {
           keyboard: [[{ text: T.askPhone, request_contact: true }]],
           resize_keyboard: true,
           one_time_keyboard: true
@@ -908,7 +995,11 @@ async function handleMenuText(chatId, tid, text) {
     const link = BOT_USERNAME_ENV
       ? `https://t.me/${BOT_USERNAME_ENV}?start=ref_${player.player_id}`
       : `${WEBAPP_URL}?ref=${player.player_id}`;
-    await tgSend(chatId, T.referral.replace('{link}', link));
+    await tgSend(chatId, T.referral
+      .replace('{link}', link)
+      .replace('{bonus}', String(REFERRAL_BONUS))
+      .replace('{count}', String(sp.referrals_count || 0))
+      .replace('{earned}', String(sp.referral_earnings || 0)));
   } else if (text.includes('How to Play') || text.includes('\u1218\u1218\u122a\u12eb') || text === '/help') {
     await tgSend(chatId, T.howTo);
   } else if (text.includes('Support') || text.includes('\u12a5\u1308\u12db')) {
@@ -1058,7 +1149,8 @@ app.post('/api/register', async (req, res) => {
     let player = telegram_id ? await findPlayerByTelegramId(telegram_id) : null;
     if (!player) player = await findPlayerByPhone(phone_number);
     if (player) return res.json({ isNew: false, user: sanitizePlayer(player) });
-    const created = await createPlayer({ username, phone_number, telegram_id, referrer_id });
+    const created = await createPlayer({ username, phone_number, telegram_id, referrer_id: cleanRef(referrer_id) });
+    await payReferrer(created);
     res.json({ isNew: true, user: sanitizePlayer(created) });
   } catch (err) {
     res.status(500).json({ error: err.message });

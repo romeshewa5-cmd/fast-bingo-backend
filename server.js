@@ -85,9 +85,13 @@ const INITIAL_WAIT_SECONDS = Number(process.env.INITIAL_WAIT_SECONDS) || 40;
 const RECHECK_WAIT_SECONDS = Number(process.env.RECHECK_WAIT_SECONDS) || 40;
 const POST_ROUND_PAUSE_SECONDS = Number(process.env.POST_ROUND_PAUSE_SECONDS) || 15;
 const WINNER_DISPLAY_SECONDS = Number(process.env.WINNER_DISPLAY_SECONDS) || 5;
+// How many balls of grace a player gets to hit BINGO after their pattern
+// completes. 1 = must claim while the completing ball is still showing.
+const BINGO_GRACE_BALLS = Number(process.env.BINGO_GRACE_BALLS) || 1;
 const MIN_WITHDRAWAL_AMOUNT = Number(process.env.MIN_WITHDRAWAL_AMOUNT) || 100;
 const SIGNUP_BONUS = 10;
 const REFERRAL_BONUS = Number(process.env.REFERRAL_BONUS) || 5;
+const MAX_CARDS_PER_PLAYER = Number(process.env.MAX_CARDS_PER_PLAYER) || 2;
 const TG_GROUP_BONUS = 10;
 
 // ============ LOCAL PERSISTENCE (survives restarts) ============
@@ -359,7 +363,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'joinfix-2026-08-03';
+const BUILD_ID = 'launch-ready-2026-08-04';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {
@@ -1239,6 +1243,16 @@ app.post('/api/games/create', async (req, res) => {
     if (parts.has(player_id)) return res.status(400).json({ success: false, error: "already_registered" });
 
     const wanted = (cards_list && cards_list.length ? cards_list : [117]).map(Number);
+    if (wanted.length > MAX_CARDS_PER_PLAYER) {
+      return res.status(400).json({ success: false, error: "too_many_cards" });
+    }
+    if (new Set(wanted).size !== wanted.length) {
+      return res.status(400).json({ success: false, error: "duplicate_cards" });
+    }
+    if (Number(cards_bought) !== wanted.length) {
+      return res.status(400).json({ success: false, error: "card_count_mismatch" });
+    }
+
     const taken = new Set();
     parts.forEach(p => (p.cards || []).forEach(c => taken.add(Number(c))));
     if (wanted.some(c => taken.has(c))) {
@@ -1249,13 +1263,26 @@ app.post('/api/games/create', async (req, res) => {
     const cost = CARD_PRICE * Number(cards_bought);
     if (sp.balance < cost) return res.status(400).json({ success: false, error: "insufficient_balance" });
 
+    // RESERVE SYNCHRONOUSLY. Everything above is sync, so nothing can interleave
+    // before this line. Previously the await below let rapid double-taps each
+    // pass the has() check and get charged separately.
+    parts.set(player_id, {
+      purchased_cards: Number(cards_bought),
+      cards: wanted,
+      username: player.username || 'Player',
+      pending: true
+    });
+
     const deductPlay = Math.min(sp.play_balance, cost);
     const deductMain = cost - deductPlay;
     const balances = await creditPlayerBalances(player_id, {
       mainAdd: -deductMain, playAdd: -deductPlay,
       type: 'entry_fee', game_id, notes: `${cards_bought} cards`
     });
-    if (!balances) return res.status(404).json({ success: false, error: "player_not_found" });
+    if (!balances) {
+      parts.delete(player_id);   // roll the reservation back
+      return res.status(404).json({ success: false, error: "player_not_found" });
+    }
 
     parts.set(player_id, {
       purchased_cards: Number(cards_bought),
@@ -1533,6 +1560,7 @@ let ballPool = [];
 let drawnBallsHistory = [];
 let gameBallInterval = null;
 let currentRoundWinners = [];
+let resolveTimer = null;
 
 function tickPayload() {
   const parts = participantsOf(currentActiveGameRoundId);
@@ -1625,7 +1653,16 @@ function winningLineCells(cardNum, drawn) {
   return [];
 }
 
+// Index into drawnHistory of the ball that COMPLETED the winning pattern.
+function patternCompletedAtIndex(cardNum, drawn) {
+  for (let i = 0; i < drawn.length; i++) {
+    if (winningLineCells(cardNum, drawn.slice(0, i + 1)).length) return i;
+  }
+  return -1;
+}
+
 async function resolveRoundWinners() {
+  if (resolveTimer) { clearTimeout(resolveTimer); resolveTimer = null; }
   if (gameBallInterval) clearInterval(gameBallInterval);
   globalGameState = "waiting";
   timeRemaining = POST_ROUND_PAUSE_SECONDS;
@@ -1724,12 +1761,28 @@ io.on('connection', (socket) => {
     // Use the shared pattern check so client and server always agree.
     if (!winningLineCells(Number(cardNum), drawnBallsHistory).length) return reject('no_winning_line');
 
+    // The pattern must have completed on one of the last BINGO_GRACE_BALLS.
+    // Claiming long after the number passed is a miss, by design.
+    const completedAt = patternCompletedAtIndex(Number(cardNum), drawnBallsHistory);
+    if (completedAt >= 0) {
+      const ballsSince = drawnBallsHistory.length - 1 - completedAt;
+      if (ballsSince >= BINGO_GRACE_BALLS) {
+        console.log(`\u23f0 missed bingo: card ${cardNum} completed ${ballsSince} balls ago`);
+        socket.emit('bingo_missed', { cardNum, ballsSince });
+        return;
+      }
+    }
+
     const player = await findPlayerById(player_id);
     if (!player || player.is_banned) return reject('player_invalid');
 
     currentRoundWinners.push({ player_id, username: player.username || 'Player', cardNum });
     console.log("🏆 Bingo:", player.username, "Card #", cardNum);
-    setTimeout(() => resolveRoundWinners(), 500);
+    // Wait briefly so simultaneous claims all land and split the pot evenly,
+    // instead of the first packet to arrive taking everything.
+    if (!resolveTimer) {
+      resolveTimer = setTimeout(() => { resolveTimer = null; resolveRoundWinners(); }, 1200);
+    }
   });
 
   socket.on('disconnect', () => console.log("🔌 Client disconnected:", socket.id));

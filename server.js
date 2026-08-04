@@ -71,6 +71,12 @@ if (/^\d+$/.test(TG_GROUP_ID)) {
 const TG_GROUP_ID_OK = !TG_GROUP_ID || /^(-100\d+|@[\w]+)$/.test(TG_GROUP_ID);
 const BOT_USERNAME_ENV = (process.env.BOT_USERNAME || '').trim().replace(/^@/, '');
 const SUPPORT_CONTACT = (process.env.SUPPORT_CONTACT || '@YourSupport').trim();
+// Auto-promo: posts a recurring ad into the group with a Play button.
+const PROMO_CHAT_ID = (process.env.PROMO_CHAT_ID || process.env.TG_GROUP_ID || '').trim();
+const PROMO_IMAGE_URL = (process.env.PROMO_IMAGE_URL || '').trim();
+const PROMO_INTERVAL_MIN = Number(process.env.PROMO_INTERVAL_MIN) || 120;
+const PROMO_ENABLED = String(process.env.PROMO_ENABLED || 'false') === 'true';
+const PROMO_DELETE_PREVIOUS = String(process.env.PROMO_DELETE_PREVIOUS || 'true') === 'true';
 const ADMIN_ID = (process.env.ADMIN_ID || '').trim();          // your telegram id
 const TELEBIRR_NUMBER = (process.env.TELEBIRR_NUMBER || '').trim();
 const CBE_NUMBER = (process.env.CBE_NUMBER || '').trim();
@@ -363,7 +369,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'returning-player-fix-2026-08-04';
+const BUILD_ID = 'autopromo-2026-08-04';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {
@@ -851,6 +857,11 @@ app.post('/api/telegram/webhook', async (req, res) => {
       const m = text.match(/^\/(approve|reject)_(\d+)$/);
       if (m) { await handleAdminDeposit(chatId, m[1], Number(m[2])); return; }
       if (text === '/pending') { await listPending(chatId); return; }
+      if (text === '/promo') {
+        await postPromo();
+        await tgSend(chatId, PROMO_CHAT_ID ? `\ud83d\udce2 Promo posted to ${PROMO_CHAT_ID}` : "\u26a0\ufe0f PROMO_CHAT_ID not set");
+        return;
+      }
     }
 
     // ---- ACTIVE WIZARD? ----
@@ -1148,6 +1159,94 @@ async function handleCallback(cb) {
     await answer('+10 ETB \u2705');
     await tgSend(chatId, T.groupOk.replace('{total}', String(balances ? balances.balance : TG_GROUP_BONUS)));
     await finishOnboarding(chatId, tid);
+  }
+}
+
+// ============ AUTO PROMO POST ============
+// Rotating Amharic ad copy so the group doesn't see the same text every time.
+const PROMO_MESSAGES = [
+  () => `🎉 <b>እንኳን ወደ ፋስት ቢንጎ በደህና መጡ!</b> 🎉\n\n` +
+    `🎁 <b>ለአዲስ ተጫዋቾች 20 ብር ቦነስ!</b>\n` +
+    `• 10 ብር የምዝገባ ቦነስ\n` +
+    `• 10 ብር የግሩፕ ቦነስ\n\n` +
+    `🤝 <b>ጓደኞችዎን ይጋብዙ እና ያትርፉ!</b>\n` +
+    `ለእያንዳንዱ ጓደኛ ${REFERRAL_BONUS} ብር\n\n` +
+    `🎮 የካርቴላ ዋጋ: <b>${CARD_PRICE} ብር</b>\n` +
+    `⚡ ፈጣን ክፍያ • በቴሌብር እና በሲቢኢ\n\n` +
+    `👇 አሁኑኑ ይጫወቱ!`,
+
+  () => `🔥 <b>ፋስት ቢንጎ — አሁን ይጫወቱ!</b> 🔥\n\n` +
+    `💰 አሸናፊው <b>80%</b> ይወስዳል\n` +
+    `⏱ በየ 3 ሰከንዱ አዲስ ቁጥር\n` +
+    `🤖 አውቶማቲክ ማርክ ማድረጊያ\n` +
+    `💸 ፈጣን ክፍያ — በቴሌብር\n\n` +
+    `🎁 አዲስ ተጫዋች ከሆኑ <b>20 ብር ቦነስ</b> ይጠብቅዎታል!\n\n` +
+    `👇 አሁኑኑ ይመዝገቡ!`,
+
+  () => `🏆 <b>አሸናፊ ይሁኑ!</b>\n\n` +
+    `በፋስት ቢንጎ በየቀኑ ብዙ ተጫዋቾች እያሸነፉ ነው።\n\n` +
+    `✅ የምዝገባ ቦነስ: <b>20 ብር</b>\n` +
+    `✅ የመግቢያ ክፍያ: <b>${CARD_PRICE} ብር</b>\n` +
+    `✅ በአንድ ዙር እስከ 2 ካርቴላ\n` +
+    `✅ ወዲያውኑ ክፍያ — በቴሌብር\n\n` +
+    `🎯 እድልዎን ይሞክሩ — አሁኑኑ!`,
+];
+
+let promoIndex = 0;
+let lastPromoMessageId = null;
+
+async function tgDeleteMessage(chat_id, message_id) {
+  if (!BOT_TOKEN || !message_id) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id, message_id })
+    });
+  } catch (e) {}
+}
+
+async function postPromo() {
+  if (!BOT_TOKEN || !PROMO_CHAT_ID) return;
+  if (!BOT_USERNAME_ENV) {
+    console.warn("\u26a0\ufe0f promo skipped - BOT_USERNAME not set");
+    return;
+  }
+
+  const text = PROMO_MESSAGES[promoIndex % PROMO_MESSAGES.length]();
+  promoIndex++;
+
+  // Deep link so the bot's /start runs (a plain webapp link can't register).
+  const startUrl = `https://t.me/${BOT_USERNAME_ENV}?start=promo`;
+  const reply_markup = {
+    inline_keyboard: [[{ text: "\ud83c\udfae \u12a0\u1201\u1295 \u12ed\u132b\u12c8\u1271 (Play Now)", url: startUrl }]]
+  };
+
+  try {
+    const usephoto = /^https?:\/\//.test(PROMO_IMAGE_URL);
+    const endpoint = usephoto ? 'sendPhoto' : 'sendMessage';
+    const body = usephoto
+      ? { chat_id: PROMO_CHAT_ID, photo: PROMO_IMAGE_URL, caption: text, parse_mode: 'HTML', reply_markup }
+      : { chat_id: PROMO_CHAT_ID, text, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup };
+
+    const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      console.warn("\u274c promo post failed:", d.description);
+      return;
+    }
+    // Remove the previous ad so the group isn't flooded with old copies.
+    if (PROMO_DELETE_PREVIOUS && lastPromoMessageId) {
+      await tgDeleteMessage(PROMO_CHAT_ID, lastPromoMessageId);
+    }
+    lastPromoMessageId = d.result.message_id;
+    console.log(`\ud83d\udce2 promo posted to ${PROMO_CHAT_ID} (msg ${lastPromoMessageId})`);
+  } catch (e) {
+    console.warn("\u274c promo error:", e.message);
   }
 }
 

@@ -363,7 +363,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'launch-ready-2026-08-04';
+const BUILD_ID = 'returning-player-fix-2026-08-04';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {
@@ -450,7 +450,16 @@ app.post('/api/auth/phone-status', async (req, res) => {
   const verified = verifyInitData((req.body || {}).initData);
   if (!verified) return res.status(401).json({ error: 'invalid_init_data' });
   const tid = String(verified.user.id);
-  const phone = tgPhoneBook.get(tid) || null;
+  let phone = tgPhoneBook.get(tid) || null;
+  if (!phone) {
+    // Cache is empty after a redeploy - the database still knows.
+    const existing = await findPlayerByTelegramId(tid);
+    if (existing && existing.phone_number) {
+      phone = existing.phone_number;
+      tgPhoneBook.set(tid, phone);
+      flushDisk();
+    }
+  }
   if (!phone) return res.json({ has_phone: false });
 
   let player = await findPlayerByTelegramId(tid);
@@ -793,6 +802,20 @@ app.post('/api/telegram/webhook', async (req, res) => {
       return;
     }
 
+    // /play - give a returning player a fresh Play button, no re-registration.
+    if (text === '/play' || text === '/menu') {
+      const p = await findPlayerByTelegramId(tid);
+      if (!p || !p.phone_number) {
+        await tgSend(chatId, T.intro, {
+          keyboard: [[{ text: T.askPhone, request_contact: true }]],
+          resize_keyboard: true, one_time_keyboard: true
+        });
+        return;
+      }
+      await finishOnboarding(chatId, tid);
+      return;
+    }
+
     if (text.startsWith('/start')) {
       // "/start ref_<player_id>" - capture who invited this user.
       const payload = text.split(/\s+/)[1] || '';
@@ -805,7 +828,10 @@ app.post('/api/telegram/webhook', async (req, res) => {
       }
 
       const player = await findPlayerByTelegramId(tid);
-      if (!player || !tgPhoneBook.has(tid)) {
+      // Only ask for a contact when there is genuinely no account, or the
+      // account has no phone. tgPhoneBook lives in memory + a disk file that
+      // Render wipes on every deploy, so it must never gate a returning player.
+      if (!player || !player.phone_number) {
         await tgSend(chatId, T.intro, {
           keyboard: [[{ text: T.askPhone, request_contact: true }]],
           resize_keyboard: true,
@@ -813,6 +839,8 @@ app.post('/api/telegram/webhook', async (req, res) => {
         });
         return;
       }
+      // Re-seed the cache from the database after a restart.
+      if (!tgPhoneBook.has(tid)) { tgPhoneBook.set(tid, player.phone_number); flushDisk(); }
       if (!player.tg_bonus_claimed) { await sendGroupOffer(chatId, player); return; }
       await finishOnboarding(chatId, tid);
       return;

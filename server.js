@@ -1976,6 +1976,27 @@ io.on('connection', (socket) => {
 });
 
 startNewRound();
+// ---- KEEP-ALIVE (free-tier stopgap only) ----------------------------------
+// Render free web services spin down after ~15 min without INBOUND traffic.
+// A self-ping creates that traffic. This is a band-aid, not a fix: it burns
+// the 750 free instance-hours/month (a single always-on service needs ~730),
+// and it cannot help if the service is already asleep. Use a paid instance
+// for real players.
+const SELF_URL = (process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || '').trim();
+const KEEPALIVE = String(process.env.KEEPALIVE || 'true') === 'true';
+
+if (SELF_URL && KEEPALIVE) {
+  setInterval(async () => {
+    try {
+      const r = await fetch(`${SELF_URL}/api/health-check`);
+      if (!r.ok) console.warn('keep-alive non-200:', r.status);
+    } catch (e) {
+      console.warn('keep-alive failed:', e.message);
+    }
+  }, 10 * 60 * 1000);   // every 10 min, comfortably inside the 15 min window
+  console.log(`💓 keep-alive pinging ${SELF_URL} every 10 min`);
+}
+
 httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`⚡ Fast Bingo running on http://0.0.0.0:${PORT}`);
   console.log(`📊 Card=${CARD_PRICE}ETB, MinPlayers=${MIN_PLAYERS_TO_START}, Wait=${INITIAL_WAIT_SECONDS}s`);

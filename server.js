@@ -1444,10 +1444,43 @@ app.get('/api/wallet/withdrawals/:player_id', async (req, res) => {
 
 // ============ ADMIN ============
 app.get('/api/admin/overview', requireAdmin, (req, res) => {
-  res.json({ state: globalGameState, game_id: currentActiveGameRoundId, timeRemaining, participants: participantsOf(currentActiveGameRoundId).size, players: inMemoryPlayers.size });
+  const parts = participantsOf(currentActiveGameRoundId);
+  const totalCards = Array.from(parts.values())
+    .reduce((n, p) => n + (Number(p.purchased_cards) || 0), 0);
+  const pot = totalCards * (CARD_PRICE - HOUSE_FEE_PER_CARD);
+  res.json({
+    state: globalGameState,
+    game_id: currentActiveGameRoundId,
+    timeRemaining,
+    participants: parts.size,
+    participantCount: parts.size,
+    minPlayersToStart: MIN_PLAYERS_TO_START,
+    totalCards,
+    pot,
+    potentialPayout: pot,
+    players: inMemoryPlayers.size
+  });
 });
 app.get('/api/admin/players', requireAdmin, async (req, res) => {
-  res.json(Array.from(inMemoryPlayers.values()).map(sanitizePlayer));
+  const q = String(req.query.search || '').trim().toLowerCase();
+  let list = [];
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from('players').select('*').limit(500);
+      if (error) console.error("admin players read:", error.message);
+      if (data) data.forEach(p => cachePlayer(p));
+    } catch (e) {}
+  }
+  list = Array.from(inMemoryPlayers.values()).map(sanitizePlayer);
+  if (q) {
+    list = list.filter(p =>
+      String(p.username || '').toLowerCase().includes(q) ||
+      String(p.phone_number || '').toLowerCase().includes(q) ||
+      String(p.player_id || '').toLowerCase().includes(q) ||
+      String(p.telegram_id || '').toLowerCase().includes(q));
+  }
+  list.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+  res.json(list.slice(0, 200));
 });
 app.post('/api/admin/players/:id/ban', requireAdmin, async (req, res) => {
   const p = await findPlayerById(req.params.id);
@@ -1459,6 +1492,160 @@ app.post('/api/admin/players/:id/unban', requireAdmin, async (req, res) => {
   if (p) await savePlayer({ ...p, is_banned: false });
   res.json({ success: true });
 });
+// ---------- DEPOSITS ----------
+app.get('/api/admin/deposits', requireAdmin, async (req, res) => {
+  const seen = new Map();
+  // In-memory first (bot flow), then DB rows.
+  pendingDeposits.forEach(d => seen.set(String(d.id), {
+    id: d.id, player_id: d.player_id, method: d.method, amount: d.amount,
+    reference_id: d.sms ? String(d.sms).slice(0, 60) : String(d.id),
+    status: d.status, requested_at: d.created_at
+  }));
+  if (supabase) {
+    try {
+      const { data } = await supabase.from('deposit_requests').select('*')
+        .order('requested_at', { ascending: false }).limit(200);
+      (data || []).forEach(d => {
+        const key = String(d.reference_id || d.id);
+        if (!seen.has(key)) seen.set(key, d);
+      });
+    } catch (e) {}
+  }
+  const list = Array.from(seen.values());
+  // Flag reference numbers submitted more than once.
+  const counts = {};
+  list.forEach(d => { const r = String(d.reference_id || ''); counts[r] = (counts[r] || 0) + 1; });
+  list.forEach(d => { d.is_duplicate = counts[String(d.reference_id || '')] > 1; });
+  list.sort((a, b) => new Date(b.requested_at || 0) - new Date(a.requested_at || 0));
+  res.json(list);
+});
+
+const DEPOSIT_BONUS_PCT = Number(process.env.DEPOSIT_BONUS_PCT ?? 0.10);
+
+app.post('/api/admin/deposits/:id/approve', requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  const rec = pendingDeposits.get(Number(id)) || pendingDeposits.get(id);
+  let player_id = rec?.player_id, amount = rec?.amount, method = rec?.method;
+
+  if (!rec && supabase) {
+    try {
+      const { data } = await supabase.from('deposit_requests').select('*')
+        .or(`reference_id.eq.${id},id.eq.${id}`).maybeSingle();
+      if (data) { player_id = data.player_id; amount = Number(data.amount); method = data.method; }
+    } catch (e) {}
+  }
+  if (!player_id || !amount) return res.status(404).json({ error: 'Deposit not found' });
+  if (rec && rec.status !== 'pending') return res.status(400).json({ error: `Already ${rec.status}` });
+
+  const bonus = Math.floor(amount * DEPOSIT_BONUS_PCT);
+  const balances = await creditPlayerBalances(player_id, {
+    mainAdd: amount, playAdd: bonus, type: 'deposit',
+    notes: `Deposit ${method || ''} #${id}${bonus ? ` (+${bonus} bonus)` : ''}`
+  });
+  if (!balances) return res.status(404).json({ error: 'Player not found' });
+
+  if (rec) rec.status = 'approved';
+  if (supabase) {
+    try { await supabase.from('deposit_requests').update({ status: 'approved' })
+      .or(`reference_id.eq.${id},id.eq.${id}`); } catch (e) {}
+  }
+  if (rec?.chat_id) {
+    await tgSend(rec.chat_id, T.depApproved
+      .replace('{amt}', String(amount)).replace('{bal}', String(balances.balance)));
+  }
+  console.log(`\u2705 admin approved deposit #${id}: +${amount} (+${bonus} bonus)`);
+  res.json({ success: true, balances, bonus });
+});
+
+app.post('/api/admin/deposits/:id/reject', requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  const rec = pendingDeposits.get(Number(id)) || pendingDeposits.get(id);
+  if (rec) rec.status = 'rejected';
+  if (supabase) {
+    try { await supabase.from('deposit_requests').update({ status: 'rejected' })
+      .or(`reference_id.eq.${id},id.eq.${id}`); } catch (e) {}
+  }
+  if (rec?.chat_id) await tgSend(rec.chat_id, T.depRejected.replace('{amt}', String(rec.amount)));
+  res.json({ success: true });
+});
+
+// ---------- WITHDRAWALS ----------
+app.get('/api/admin/withdrawals', requireAdmin, async (req, res) => {
+  if (!supabase) return res.json([]);
+  try {
+    const { data, error } = await supabase.from('withdrawal_requests').select('*')
+      .order('requested_at', { ascending: false }).limit(200);
+    if (error) console.error("admin withdrawals:", error.message);
+    res.json(data || []);
+  } catch (e) { res.json([]); }
+});
+
+app.post('/api/admin/withdrawals/:id/:action', requireAdmin, async (req, res) => {
+  const { id, action } = req.params;
+  if (!['approve', 'reject'].includes(action)) return res.status(400).json({ error: 'Bad action' });
+  if (!supabase) return res.status(400).json({ error: 'Supabase required' });
+
+  try {
+    const { data: w } = await supabase.from('withdrawal_requests').select('*').eq('id', id).maybeSingle();
+    if (!w) return res.status(404).json({ error: 'Withdrawal not found' });
+    if (w.status !== 'pending') return res.status(400).json({ error: `Already ${w.status}` });
+
+    if (action === 'reject') {
+      // The amount was debited when requested - give it back.
+      await creditPlayerBalances(w.player_id, {
+        mainAdd: Number(w.amount), type: 'withdrawal_refund',
+        notes: `Withdrawal #${id} rejected - refunded`
+      });
+    }
+    await supabase.from('withdrawal_requests')
+      .update({ status: action === 'approve' ? 'approved' : 'rejected' }).eq('id', id);
+
+    const player = await findPlayerById(w.player_id);
+    if (player?.telegram_id) {
+      await tgSend(player.telegram_id, action === 'approve'
+        ? `\u2705 <b>ወጪ ተከናውኗል!</b>\n\n\u1218\u1320\u1295: <b>${w.amount} \u1265\u122d</b>\n\u1230\u120d\u12ad: ${w.account_number || ''}`
+        : `\u274c <b>የወጪ ጥያቄ ተቀባይነት አላገኘም</b>\n\n${w.amount} \u1265\u122d \u12c8\u12f0 \u1202\u1233\u1265\u12ce \u1270\u1218\u120d\u1230\u12cd\u1363\u12a0\u120d\u1362`);
+    }
+    console.log(`\u2705 admin ${action}d withdrawal #${id}`);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- COUPONS ----------
+app.get('/api/admin/coupons', requireAdmin, (req, res) => {
+  res.json(inMemoryCoupons.filter(c => c.is_active));
+});
+
+app.post('/api/admin/coupons/create', requireAdmin, (req, res) => {
+  const { code, bonus_amount, max_uses } = req.body || {};
+  if (!code || !bonus_amount) return res.status(400).json({ error: 'code and bonus_amount required' });
+  const upper = String(code).toUpperCase().trim();
+  if (inMemoryCoupons.some(c => c.code === upper)) {
+    return res.status(400).json({ error: 'Coupon code already exists' });
+  }
+  const coupon = {
+    code: upper, bonus_amount: Number(bonus_amount),
+    max_uses: Number(max_uses) || 100, used_count: 0, is_active: true
+  };
+  inMemoryCoupons.push(coupon);
+  console.log("\ud83c\udf9f\ufe0f coupon created:", upper, bonus_amount, "ETB");
+  res.json({ success: true, coupon });
+});
+
+// ---------- TRANSACTIONS ----------
+app.get('/api/admin/transactions', requireAdmin, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 100, 500);
+  if (!supabase) return res.json([]);
+  try {
+    const { data, error } = await supabase.from('transactions').select('*')
+      .order('created_at', { ascending: false }).limit(limit);
+    if (error) console.error("admin transactions:", error.message);
+    res.json(data || []);
+  } catch (e) { res.json([]); }
+});
+
 app.post('/api/admin/credit-player', requireAdmin, async (req, res) => {
   const { player_id, amount, wallet_type } = req.body;
   if (!player_id || !amount) return res.status(400).json({ error: "Missing fields" });

@@ -369,7 +369,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'autopromo-2026-08-04';
+const BUILD_ID = 'promo-diag-2026-08-04';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {
@@ -853,15 +853,30 @@ app.post('/api/telegram/webhook', async (req, res) => {
     }
 
     // ---- ADMIN COMMANDS ----
+    // /promo answers even for non-admins so the failure is never silent.
+    if (text === '/promo' || text === '/promotest') {
+      if (!ADMIN_ID) {
+        await tgSend(chatId, "\u26a0\ufe0f ADMIN_ID is not set on the server.\nYour Telegram ID: <code>" + tid + "</code>");
+        return;
+      }
+      if (String(tid) !== String(ADMIN_ID)) {
+        await tgSend(chatId,
+          "\u26d4 Not authorised.\nYour ID: <code>" + tid + "</code>\nADMIN_ID on server: <code>" + ADMIN_ID + "</code>\n\nThese must match exactly.");
+        return;
+      }
+      if (!PROMO_CHAT_ID) { await tgSend(chatId, "\u26a0\ufe0f PROMO_CHAT_ID not set."); return; }
+      if (!BOT_USERNAME_ENV) { await tgSend(chatId, "\u26a0\ufe0f BOT_USERNAME not set - promo button cannot be built."); return; }
+      const r = await postPromo();
+      await tgSend(chatId, r && r.ok
+        ? `\ud83d\udce2 Posted to ${PROMO_CHAT_ID}`
+        : `\u274c Post failed: ${(r && r.error) || 'unknown'}\n\nIs the bot an ADMIN in ${PROMO_CHAT_ID}?`);
+      return;
+    }
+
     if (ADMIN_ID && String(tid) === String(ADMIN_ID)) {
       const m = text.match(/^\/(approve|reject)_(\d+)$/);
       if (m) { await handleAdminDeposit(chatId, m[1], Number(m[2])); return; }
       if (text === '/pending') { await listPending(chatId); return; }
-      if (text === '/promo') {
-        await postPromo();
-        await tgSend(chatId, PROMO_CHAT_ID ? `\ud83d\udce2 Promo posted to ${PROMO_CHAT_ID}` : "\u26a0\ufe0f PROMO_CHAT_ID not set");
-        return;
-      }
     }
 
     // ---- ACTIVE WIZARD? ----
@@ -1207,10 +1222,10 @@ async function tgDeleteMessage(chat_id, message_id) {
 }
 
 async function postPromo() {
-  if (!BOT_TOKEN || !PROMO_CHAT_ID) return;
+  if (!BOT_TOKEN || !PROMO_CHAT_ID) return { ok: false, error: 'missing BOT_TOKEN or PROMO_CHAT_ID' };
   if (!BOT_USERNAME_ENV) {
     console.warn("\u26a0\ufe0f promo skipped - BOT_USERNAME not set");
-    return;
+    return { ok: false, error: 'BOT_USERNAME not set' };
   }
 
   const text = PROMO_MESSAGES[promoIndex % PROMO_MESSAGES.length]();
@@ -1237,7 +1252,7 @@ async function postPromo() {
     const d = await r.json();
     if (!d.ok) {
       console.warn("\u274c promo post failed:", d.description);
-      return;
+      return { ok: false, error: d.description };
     }
     // Remove the previous ad so the group isn't flooded with old copies.
     if (PROMO_DELETE_PREVIOUS && lastPromoMessageId) {
@@ -1245,8 +1260,10 @@ async function postPromo() {
     }
     lastPromoMessageId = d.result.message_id;
     console.log(`\ud83d\udce2 promo posted to ${PROMO_CHAT_ID} (msg ${lastPromoMessageId})`);
+    return { ok: true, message_id: lastPromoMessageId };
   } catch (e) {
     console.warn("\u274c promo error:", e.message);
+    return { ok: false, error: e.message };
   }
 }
 
@@ -2134,4 +2151,14 @@ httpServer.listen(PORT, '0.0.0.0', () => {
     console.warn(`   ⚠️ TG_GROUP_ID "${TG_GROUP_ID}" does not look like a supergroup id (-100...) or @username`);
   }
   console.log(`✈️ TG_GROUP_LINK: ${TG_GROUP_LINK || 'NOT SET'}`);
+  console.log(`👤 ADMIN_ID: ${ADMIN_ID || 'NOT SET - /promo and /approve will not work'}`);
+  console.log(`🖼️ PROMO_IMAGE_URL: ${PROMO_IMAGE_URL || '(none - text-only posts)'}`);
+
+  if (PROMO_ENABLED && PROMO_CHAT_ID) {
+    console.log(`📢 Auto-promo ON: every ${PROMO_INTERVAL_MIN} min to ${PROMO_CHAT_ID}`);
+    setTimeout(postPromo, 30 * 1000);
+    setInterval(postPromo, PROMO_INTERVAL_MIN * 60 * 1000);
+  } else {
+    console.log(`📢 Auto-promo OFF (PROMO_ENABLED=${process.env.PROMO_ENABLED || 'unset'}, PROMO_CHAT_ID=${PROMO_CHAT_ID || 'unset'})`);
+  }
 });

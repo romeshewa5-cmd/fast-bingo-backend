@@ -326,17 +326,23 @@ function requireAdmin(req, res, next) {
 //                        API ROUTES
 // ============================================================
 
-// Shows whether Telegram is actually delivering updates to THIS server.
 app.post('/api/auth/token', async (req, res) => {
   const { token } = req.body || {};
-  const rec = token && loginTokens.get(String(token));
-  if (!rec) return res.status(401).json({ error: 'invalid_token' });
-  const player = await findPlayerByTelegramId(rec.tid);
-  if (!player) return res.status(404).json({ error: 'player_not_found', telegram_id: rec.tid });
-  console.log("🔑 token login:", rec.tid, player.player_id);
+  const tid = verifyLoginToken(token);
+  if (!tid) {
+    console.warn("\u26d4 token login rejected (bad/stale signature)");
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+  const player = await findPlayerByTelegramId(tid);
+  if (!player) {
+    console.warn("\u26d4 token login: no player for telegram_id", tid);
+    return res.status(404).json({ error: 'player_not_found', telegram_id: tid });
+  }
+  console.log("\ud83d\udd11 token login:", tid, player.player_id);
   res.json({ isNew: false, user: sanitizePlayer(player) });
 });
 
+// Shows whether Telegram is actually delivering updates to THIS server.
 app.get('/api/debug/webhook', async (req, res) => {
   const out = { updates_received: webhookHits, last_update_at: lastWebhookAt || null };
   if (BOT_TOKEN) {
@@ -349,7 +355,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'history+fk-2026-08-02';
+const BUILD_ID = 'stable-token-2026-08-02';
 
 app.get('/api/health', (req, res) => {
   res.json({
@@ -484,15 +490,30 @@ const seenUpdateIds = new Set();
 // minted server-side and delivered ONLY into that user's private chat is a
 // safe fallback: unguessable, and bound to a single telegram_id.
 function mintLoginToken(tid) {
+  // DERIVED, not stored. Render wipes the filesystem on every deploy, so any
+  // token kept on disk died with the next release and every Play button in
+  // every chat started returning 401. An HMAC of the telegram id keyed by the
+  // bot token is stable across restarts, unguessable without the bot token,
+  // and needs no storage at all.
   tid = String(tid);
-  const existing = tidToToken.get(tid);
-  if (existing) return existing;
-  const tok = crypto.randomBytes(24).toString('hex');
-  loginTokens.set(tok, { tid, created: Date.now() });
-  tidToToken.set(tid, tok);
-  flushDisk();
-  return tok;
+  const sig = crypto.createHmac('sha256', BOT_TOKEN || 'fastbingo-fallback-secret')
+    .update('tgauth:' + tid).digest('hex').slice(0, 32);
+  return tid + '.' + sig;
 }
+
+function verifyLoginToken(token) {
+  if (!token) return null;
+  const str = String(token);
+  const dot = str.lastIndexOf('.');
+  if (dot > 0) {
+    const tid = str.slice(0, dot);
+    if (/^\d+$/.test(tid) && mintLoginToken(tid) === str) return tid;
+  }
+  // Legacy random tokens minted before this change (in memory only).
+  const rec = loginTokens.get(str);
+  return rec ? rec.tid : null;
+}
+
 function playUrl(tid) {
   const base = WEBAPP_URL.replace(/\/+$/, '');
   return base + '/?tgauth=' + mintLoginToken(tid);

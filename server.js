@@ -446,7 +446,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'withdraw-gates-2026-08-05';
+const BUILD_ID = 'spectator-2026-08-05';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {

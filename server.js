@@ -81,6 +81,14 @@ const ADMIN_ID = (process.env.ADMIN_ID || '').trim();          // your telegram 
 const TELEBIRR_NUMBER = (process.env.TELEBIRR_NUMBER || '').trim();
 const CBE_NUMBER = (process.env.CBE_NUMBER || '').trim();
 const MIN_DEPOSIT_AMOUNT = Number(process.env.MIN_DEPOSIT_AMOUNT) || 50;
+// First-deposit bonus: 100% matched, capped so one big deposit can't drain the
+// float. Every later deposit falls back to DEPOSIT_BONUS_PCT.
+const FIRST_DEPOSIT_BONUS_PCT = Number(process.env.FIRST_DEPOSIT_BONUS_PCT ?? 1.0);
+const FIRST_DEPOSIT_BONUS_CAP = Number(process.env.FIRST_DEPOSIT_BONUS_CAP) || 200;
+// Withdrawal gates - stop bonus money being cashed out without real play.
+const MIN_DEPOSIT_BEFORE_WITHDRAW = Number(process.env.MIN_DEPOSIT_BEFORE_WITHDRAW) || 50;
+const MIN_GAMES_BEFORE_WITHDRAW = Number(process.env.MIN_GAMES_BEFORE_WITHDRAW) || 5;
+const WITHDRAW_KEEP_BALANCE = Number(process.env.WITHDRAW_KEEP_BALANCE) || 50;
 const CARD_PRICE = Number(process.env.CARD_PRICE) || 10;
 const PAYOUT_PERCENTAGE = Number(process.env.PAYOUT_PERCENTAGE) || 0.8;
 // House keeps a flat fee per card; the rest goes to the winner(s).
@@ -98,15 +106,23 @@ const MIN_WITHDRAWAL_AMOUNT = Number(process.env.MIN_WITHDRAWAL_AMOUNT) || 100;
 const SIGNUP_BONUS = 10;
 const REFERRAL_BONUS = Number(process.env.REFERRAL_BONUS) || 5;
 const MAX_CARDS_PER_PLAYER = Number(process.env.MAX_CARDS_PER_PLAYER) || 2;
+// House cartelas: keep early rounds alive so a lone player isn't stuck in an
+// empty lobby. Disabled automatically once real players show up.
+const HOUSE_ENABLED = String(process.env.HOUSE_ENABLED || 'true') === 'true';
+const HOUSE_NAMES = (process.env.HOUSE_NAMES || 'Abel,Samson,Tebarek')
+  .split(',').map(x => x.trim()).filter(Boolean);
+const HOUSE_MIN_REAL_PLAYERS = Number(process.env.HOUSE_MIN_REAL_PLAYERS) || 4;
 const TG_GROUP_BONUS = 10;
 
 // ============ LOCAL PERSISTENCE (survives restarts) ============
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PLAYERS_FILE = path.join(DATA_DIR, 'players.json');
 const TOKENS_FILE = path.join(DATA_DIR, 'tokens.json');
+const STATS_FILE = path.join(DATA_DIR, 'stats.json');
 const PHONES_FILE = path.join(DATA_DIR, 'phones.json');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 
+const statsCache = new Map();    // player_id -> { deposited, games, deposits }
 const loginTokens = new Map();   // token -> { tid, created }
 const tidToToken = new Map();    // tid   -> token
 const inMemoryPlayers = new Map();        // player_id -> player
@@ -136,6 +152,10 @@ function loadDisk() {
     Object.entries(raw || {}).forEach(([k, v]) => tgPhoneBook.set(String(k), v));
   } catch (e) {}
   try {
+    const raw = JSON.parse(fs.readFileSync(STATS_FILE, 'utf8'));
+    Object.entries(raw || {}).forEach(([k, v]) => statsCache.set(k, v));
+  } catch (e) {}
+  try {
     const raw = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
     Object.entries(raw || {}).forEach(([tok, tid]) => {
       loginTokens.set(tok, { tid: String(tid), created: 0 });
@@ -155,6 +175,7 @@ function flushDisk() {
       loginTokens.forEach((v, k) => { t[k] = v.tid; });
       fs.writeFileSync(TOKENS_FILE, JSON.stringify(t));
     } catch (e) {}
+    try { fs.writeFileSync(STATS_FILE, JSON.stringify(Object.fromEntries(statsCache))); } catch (e) {}
   }, 400);
 }
 loadDisk();
@@ -329,6 +350,62 @@ async function creditPlayerBalances(player_id, { mainAdd = 0, playAdd = 0, type,
   return { main_balance: newMain, play_balance: newPlay, balance: newMain + newPlay };
 }
 
+// Lifetime totals used by the withdrawal gates.
+// In-memory mirror of the lifetime stats, so the withdrawal gates still work
+// if Supabase is unavailable. Without this a DB blip would lock every player
+// out of withdrawing (getPlayerStats would return zeros = "never deposited").
+function bumpStats(player_id, patch) {
+  const cur = statsCache.get(player_id) || { deposited: 0, games: 0, deposits: 0 };
+  cur.deposited += patch.deposited || 0;
+  cur.games += patch.games || 0;
+  cur.deposits += patch.deposits || 0;
+  statsCache.set(player_id, cur);
+  flushDisk();
+}
+
+async function getPlayerStats(player_id) {
+  const cached = statsCache.get(player_id) || { deposited: 0, games: 0, deposits: 0 };
+  if (!supabase) return { ...cached };
+  try {
+    const { data, error } = await supabase.from('transactions')
+      .select('type, amount').eq('player_id', player_id).limit(5000);
+    if (error) { console.error('stats read:', error.message); return { ...cached }; }
+    const out = { deposited: 0, games: 0, deposits: 0 };
+    (data || []).forEach(t => {
+      if (t.type === 'deposit') { out.deposited += Number(t.amount) || 0; out.deposits++; }
+      else if (t.type === 'entry_fee') out.games++;
+    });
+    // Trust whichever source has seen more - never less than the cache.
+    return {
+      deposited: Math.max(out.deposited, cached.deposited),
+      games: Math.max(out.games, cached.games),
+      deposits: Math.max(out.deposits, cached.deposits)
+    };
+  } catch (e) {
+    console.error('stats threw:', e.message);
+    return { ...cached };
+  }
+}
+
+// Shared rule for both the bot wizard and the web API.
+// Returns { ok } or { ok:false, reason, need }.
+async function checkWithdrawEligibility(player_id, amount, mainBalanceAfter) {
+  const st = await getPlayerStats(player_id);
+
+  if (st.deposited < MIN_DEPOSIT_BEFORE_WITHDRAW) {
+    return { ok: false, reason: 'need_deposit',
+             need: MIN_DEPOSIT_BEFORE_WITHDRAW - st.deposited, stats: st };
+  }
+  // Either enough games played, OR enough left behind in the wallet.
+  const playedEnough = st.games >= MIN_GAMES_BEFORE_WITHDRAW;
+  const keepsEnough = mainBalanceAfter >= WITHDRAW_KEEP_BALANCE;
+  if (!playedEnough && !keepsEnough) {
+    return { ok: false, reason: 'need_games',
+             need: MIN_GAMES_BEFORE_WITHDRAW - st.games, stats: st };
+  }
+  return { ok: true, stats: st };
+}
+
 function requireAdmin(req, res, next) {
   const secret = process.env.ADMIN_SECRET || '';
   const provided = req.headers['x-admin-secret'] || '';
@@ -369,7 +446,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'promo-diag-2026-08-04';
+const BUILD_ID = 'withdraw-gates-2026-08-05';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {
@@ -377,7 +454,13 @@ app.get('/api/config', (req, res) => {
     bot_username: BOT_USERNAME_ENV || null,
     referral_bonus: REFERRAL_BONUS,
     card_price: CARD_PRICE,
-    house_fee: HOUSE_FEE_PER_CARD
+    house_fee: HOUSE_FEE_PER_CARD,
+    min_withdrawal: MIN_WITHDRAWAL_AMOUNT,
+    min_deposit_before_withdraw: MIN_DEPOSIT_BEFORE_WITHDRAW,
+    min_games_before_withdraw: MIN_GAMES_BEFORE_WITHDRAW,
+    withdraw_keep_balance: WITHDRAW_KEEP_BALANCE,
+    first_deposit_bonus_pct: FIRST_DEPOSIT_BONUS_PCT,
+    first_deposit_bonus_cap: FIRST_DEPOSIT_BONUS_CAP
   });
 });
 
@@ -646,8 +729,27 @@ const T = {
   wdMin: "❌ ዝቅተኛው {min} ብር ነው:",
   wdNoFunds: "❌ በቂ ሂሳብ የለዎትም። የሚወጣ: {bal} ብር\n\n(የቦነስ ገንዘብ ማውጣት አይቻልም)",
   wdPhone: "የቴሌብር ስልክ ቁጥርዎን ያስገቡ:",
+  wdNeedDeposit:
+    "🔒 <b>ገንዘብ ማውጣት አይቻልም</b>\n\n" +
+    "የቦነስ ገንዘብ ለማውጣት መጀመሪያ ቢያንስ <b>{min} ብር</b> ማስገባት አለብዎት።\n\n" +
+    "እስካሁን ያስገቡት: <b>{done} ብር</b>\n" +
+    "የቀረው: <b>{need} ብር</b>\n\n" +
+    "🏦 «Add Funds» ተጭነው ገንዘብ ያስገቡ።",
+  wdNeedGames:
+    "🔒 <b>ገንዘብ ማውጣት አይቻልም</b>\n\n" +
+    "ለማውጣት ከሚከተሉት አንዱን ማሟላት አለብዎት፦\n\n" +
+    "1️⃣ ቢያንስ <b>{minGames} ጨዋታ</b> መጫወት\n" +
+    "   የተጫወቱት: <b>{games}</b> (የቀረው {need})\n\n" +
+    "2️⃣ ወይም ከወጪ በኋላ ቢያንስ <b>{keep} ብር</b> በሂሳብዎ ማስቀረት\n\n" +
+    "🎮 ጥቂት ጨዋታ ተጫውተው እንደገና ይሞክሩ።",
   wdDone: "✅ <b>ጥያቄዎ ገብቷል!</b>\n\nመጠን: <b>{amt} ብር</b>\nስልክ: {phone}\n\nበ1-2 ሰዓት ውስጥ ይላካል።",
   txnsEmpty: "ገና ምንም ግብይት የለም።",
+  notifyDepositPending:
+    "🧾 <b>የገቢ ጥያቄ ደርሶናል</b>\n\n💰 መጠን: <b>{amt} ብር</b>\n🏦 መንገድ: {method}\n⏳ ሁኔታ: በመጠባበቅ ላይ\n\nከተረጋገጠ በኋላ ወዲያውኑ እናሳውቅዎታለን።",
+  notifyWithdrawPending:
+    "🧾 <b>የወጪ ጥያቄ ደርሶናል</b>\n\n💰 መጠን: <b>{amt} ብር</b>\n📱 ወደ: {acct}\n⏳ ሁኔታ: በመጠባበቅ ላይ\n💵 ቀሪ ሂሳብ: <b>{bal} ብር</b>\n\nበ1-2 ሰዓት ውስጥ ይላካል።",
+  notifyCoupon:
+    "🎟 <b>ኩፖን ተቀብለዋል!</b>\n\n🎁 ቦነስ: <b>+{amt} ብር</b>\n💵 ጠቅላላ ሂሳብ: <b>{bal} ብር</b>",
   txnsTitle: "📋 <b>የመጨረሻዎቹ ግብይቶች</b>\n\n",
   cancelled: "ተሰርዟል።",
   btnCancel: "❌ ተመለስ",
@@ -662,7 +764,7 @@ const T = {
     "3️⃣ ኳሶች ሲወጡ ቁጥሮችዎን ምልክት ያድርጉ\n" +
     "4️⃣ መስመር ወይም ማዕዘን ሲሞሉ\n" +
     "5️⃣ ቢንጎ! የሚለውን ይጫኑ እና ያሸንፉ\n\n" +
-    "🏆 አሸናፊው ከጠቅላላ ገንዘቡ 80% ይወስዳል።",
+    "🏆 አሸናፊው ጠቅላላውን ደራሽ ይወስዳል።",
   support: "🎧 እገዛ ይፈልጋሉ?\nበአድሚን ያግኙን: {support}",
   referral:
     "🤝 <b>ጓደኞችዎን ይጋብዙ እና ያትርፉ!</b>\n\n" +
@@ -987,6 +1089,25 @@ async function handleConversation(chatId, tid, text, player) {
       await tgSend(chatId, T.wdNoFunds.replace('{bal}', String(fsp.main_balance)), mainMenuKeyboard(tid));
       return true;
     }
+
+    // Bonus money can't leave until the player has deposited and played.
+    const gate = await checkWithdrawEligibility(
+      player.player_id, amount, fsp.main_balance - amount);
+    if (!gate.ok) {
+      clearConv(tid);
+      const msg = gate.reason === 'need_deposit'
+        ? T.wdNeedDeposit
+            .replace('{min}', String(MIN_DEPOSIT_BEFORE_WITHDRAW))
+            .replace('{done}', String(gate.stats.deposited))
+            .replace('{need}', String(gate.need))
+        : T.wdNeedGames
+            .replace('{minGames}', String(MIN_GAMES_BEFORE_WITHDRAW))
+            .replace('{games}', String(gate.stats.games))
+            .replace('{need}', String(gate.need))
+            .replace('{keep}', String(WITHDRAW_KEEP_BALANCE));
+      await tgSend(chatId, msg, mainMenuKeyboard(tid));
+      return true;
+    }
     const balances = await creditPlayerBalances(player.player_id, {
       mainAdd: -amount, type: 'withdrawal', notes: `Withdraw to ${phone}`
     });
@@ -1180,6 +1301,7 @@ async function handleCallback(cb) {
 // ============ AUTO PROMO POST ============
 // Rotating Amharic ad copy so the group doesn't see the same text every time.
 const PROMO_MESSAGES = [
+  // 1 — welcome / signup bonus
   () => `🎉 <b>እንኳን ወደ ፋስት ቢንጎ በደህና መጡ!</b> 🎉\n\n` +
     `🎁 <b>ለአዲስ ተጫዋቾች 20 ብር ቦነስ!</b>\n` +
     `• 10 ብር የምዝገባ ቦነስ\n` +
@@ -1190,21 +1312,57 @@ const PROMO_MESSAGES = [
     `⚡ ፈጣን ክፍያ • በቴሌብር እና በሲቢኢ\n\n` +
     `👇 አሁኑኑ ይጫወቱ!`,
 
-  () => `🔥 <b>ፋስት ቢንጎ — አሁን ይጫወቱ!</b> 🔥\n\n` +
-    `💰 አሸናፊው <b>80%</b> ይወስዳል\n` +
+  // 2 — teaser: who wins today?
+  () => `📢 <b>ዛሬ የሚያሸንፈው ማን ይሆን?</b> 👀\n\n` +
+    `🎯 ምናልባት ቀጣዩ አሸናፊ እርስዎ ሊሆኑ ይችላሉ!\n\n` +
+    `💥 ካርቴላዎን ይምረጡ፣ በጨዋታው ይሳተፉ እና\n` +
+    `የማሸነፍ እድልዎን ይሞክሩ።\n\n` +
+    `🏆 ብዙ ሰዎች እያሸነፉ ነው…\n` +
+    `ቀጣዩ ስም የእርስዎ እንዲሆን ምን ያውቃሉ?\n\n` +
+    `🚀 አሁኑኑ ፋስት ቢንጎ ይግቡ፣ እድልዎን ይሞክሩ!`,
+
+  // 3 — luck / don't miss out
+  () => `🔥 <b>እድል አይጠብቅም!</b> 🍀\n\n` +
+    `🎯 ዛሬ የፋስት ቢንጎ ጨዋታዎችን እንዳያመልጥዎ!\n\n` +
+    `🤩 አንድ ካርቴላ ብቻ የዛሬን ቀን ወደ\n` +
+    `አሸናፊነት ሊቀይር ይችላል!\n\n` +
+    `💸 ይጫወቱ • 🏆 ያሸንፉ • 💰 ሽልማትዎን ይውሰዱ!\n\n` +
+    `🚀 አሁኑኑ ይቀላቀሉ እና እድልዎን ይሞክሩ!`,
+
+  // 4 — game features (no payout-percentage claim)
+  () => `⚡ <b>ፋስት ቢንጎ — ፈጣን እና ቀላል!</b> ⚡\n\n` +
     `⏱ በየ 3 ሰከንዱ አዲስ ቁጥር\n` +
     `🤖 አውቶማቲክ ማርክ ማድረጊያ\n` +
-    `💸 ፈጣን ክፍያ — በቴሌብር\n\n` +
+    `🔢 በአንድ ዙር እስከ 2 ካርቴላ\n` +
+    `💸 ፈጣን ክፍያ — በቴሌብር እና በሲቢኢ\n` +
+    `📱 ከቴሌግራም ሳይወጡ ይጫወቱ\n\n` +
     `🎁 አዲስ ተጫዋች ከሆኑ <b>20 ብር ቦነስ</b> ይጠብቅዎታል!\n\n` +
     `👇 አሁኑኑ ይመዝገቡ!`,
 
-  () => `🏆 <b>አሸናፊ ይሁኑ!</b>\n\n` +
-    `በፋስት ቢንጎ በየቀኑ ብዙ ተጫዋቾች እያሸነፉ ነው።\n\n` +
-    `✅ የምዝገባ ቦነስ: <b>20 ብር</b>\n` +
-    `✅ የመግቢያ ክፍያ: <b>${CARD_PRICE} ብር</b>\n` +
-    `✅ በአንድ ዙር እስከ 2 ካርቴላ\n` +
-    `✅ ወዲያውኑ ክፍያ — በቴሌብር\n\n` +
-    `🎯 እድልዎን ይሞክሩ — አሁኑኑ!`,
+  // 5 — winners hype
+  () => `🏆 <b>የማሸነፍ ቀን ነው!</b> 🎉\n\n` +
+    `🎯 ወደ ፋስት ቢንጎ ይግቡ፣ የሚወዱትን ካርቴላ\n` +
+    `ይምረጡ እና የማሸነፍ እድልዎን ያሳድጉ!\n\n` +
+    `💰 ትንሽ ተጫውተው ትልቅ ሽልማት ማሸነፍ ይችላሉ!\n\n` +
+    `⏰ ጨዋታዎች በመጀመር ላይ ናቸው፣\n` +
+    `እንዳያመልጥዎ አሁኑኑ ይግቡ! 🚀\n\n` +
+    `🎰 ፋስት ቢንጎ — ይጫወቱ፣ ይዝናኑ፣ ያሸንፉ! 🍀`,
+
+  // 6 — refer & earn
+  () => `🤝 <b>ጓደኛ ጋብዘው ${REFERRAL_BONUS} ብር ያግኙ!</b> 💰\n\n` +
+    `📲 የእርስዎን ሊንክ ለጓደኞችዎ ይላኩ\n` +
+    `✅ ጓደኛዎ ሲመዘገብ ወዲያውኑ ${REFERRAL_BONUS} ብር ወደ ሂሳብዎ\n` +
+    `♾ የጋበዙት ቁጥር ገደብ የለውም!\n\n` +
+    `💡 10 ጓደኛ = <b>${REFERRAL_BONUS * 10} ብር</b>\n\n` +
+    `👇 ቦቱን ከፍተው «🤝 Refer & Earn» ይጫኑ`,
+
+  // 7 — evening / prime time
+  () => `🌙 <b>የምሽት ጨዋታ ተጀምሯል!</b> 🎲\n\n` +
+    `🔥 አሁን ተጫዋቾች እየገቡ ነው —\n` +
+    `ደራሹ እየጨመረ ነው!\n\n` +
+    `🎯 ካርቴላዎን ይያዙ እና ይቀላቀሉ\n` +
+    `💸 አሸናፊው ወዲያውኑ ይከፈለዋል\n\n` +
+    `⏳ ቀጣዩ ዙር ሊጀምር ነው — አይዘግዩ!`,
 ];
 
 let promoIndex = 0;
@@ -1265,6 +1423,14 @@ async function postPromo() {
     console.warn("\u274c promo error:", e.message);
     return { ok: false, error: e.message };
   }
+}
+
+// Send a message to a player by player_id (looks up their telegram_id).
+async function notifyPlayer(player_id, text) {
+  try {
+    const p = await findPlayerById(player_id);
+    if (p && p.telegram_id) await tgSend(p.telegram_id, text);
+  } catch (e) { console.warn('notifyPlayer failed:', e.message); }
 }
 
 async function tgSend(chat_id, text, reply_markup) {
@@ -1455,6 +1621,11 @@ app.post('/api/games/create', async (req, res) => {
       } catch (e) { console.error("\u274c game_participants insert threw:", e.message); }
     }
 
+    bumpStats(player_id, { games: 1 });
+
+    // Seed house cartelas immediately so the waiting lobby already looks busy.
+    addHousePlayers();
+
     broadcastTick();
     console.log(`✅ Joined round ${game_id}: ${parts.size} participant(s)`);
     res.json({ success: true, ...balances });
@@ -1514,16 +1685,52 @@ app.get('/api/history/:player_id', async (req, res) => {
 });
 
 app.get('/api/leaderboard', async (req, res) => {
-  if (supabase) {
+  // Ranked by WINS in the period, not by wallet size - a rich player who never
+  // plays shouldn't top the board.
+  const period = String(req.query.period || 'daily');
+  const since = new Date();
+  if (period === 'weekly') since.setDate(since.getDate() - 7);
+  else since.setHours(0, 0, 0, 0);
+
+  if (!supabase) return res.json([]);
+  try {
+    const { data, error } = await supabase.from('transactions')
+      .select('player_id, amount, created_at')
+      .eq('type', 'payout')
+      .gte('created_at', since.toISOString())
+      .limit(2000);
+    if (error) { console.error('leaderboard:', error.message); return res.json([]); }
+
+    const tally = {};
+    (data || []).forEach(t => {
+      const k = t.player_id;
+      if (!tally[k]) tally[k] = { wins: 0, won: 0 };
+      tally[k].wins++;
+      tally[k].won += Number(t.amount) || 0;
+    });
+
+    const ids = Object.keys(tally);
+    if (!ids.length) return res.json([]);
+
+    const names = {};
     try {
-      const { data } = await supabase.from('players').select('username, balance').order('balance', { ascending: false }).limit(10);
-      if (data) return res.json(data);
-    } catch (err) {}
+      const { data: ps } = await supabase.from('players')
+        .select('player_id, username').in('player_id', ids);
+      (ps || []).forEach(p => { names[p.player_id] = p.username; });
+    } catch (e) {}
+
+    const list = ids.map(id => ({
+      player_id: id,
+      username: names[id] || inMemoryPlayers.get(id)?.username || 'Player',
+      wins: tally[id].wins,
+      won: tally[id].won
+    })).sort((a, b) => b.wins - a.wins || b.won - a.won).slice(0, 10);
+
+    res.json(list);
+  } catch (err) {
+    console.error('leaderboard threw:', err.message);
+    res.json([]);
   }
-  const list = Array.from(inMemoryPlayers.values()).map(sanitizePlayer)
-    .sort((a, b) => b.balance - a.balance).slice(0, 10)
-    .map(p => ({ username: p.username, balance: p.balance }));
-  res.json(list);
 });
 
 app.post('/api/wallet/deposit-request', async (req, res) => {
@@ -1550,6 +1757,9 @@ app.post('/api/wallet/redeem-coupon', async (req, res) => {
   if (!balances) return res.status(404).json({ success: false, error: "Player not found" });
   couponRedemptions.add(key);
   coupon.used_count++;
+  await notifyPlayer(player_id, T.notifyCoupon
+    .replace('{amt}', String(coupon.bonus_amount))
+    .replace('{bal}', String(balances ? balances.balance : '?')));
   res.json({ success: true, coupon_amount: coupon.bonus_amount, balances });
 });
 
@@ -1563,6 +1773,22 @@ app.post('/api/wallet/withdraw-request', async (req, res) => {
     if (!player) return res.status(404).json({ success: false, error: "Player not found" });
     const sp = sanitizePlayer(player);
     if (sp.main_balance < Number(amount)) return res.status(400).json({ success: false, error: "Insufficient main balance" });
+
+    const gate = await checkWithdrawEligibility(
+      player_id, Number(amount), sp.main_balance - Number(amount));
+    if (!gate.ok) {
+      return res.status(400).json({
+        success: false,
+        error: gate.reason,
+        need: gate.need,
+        stats: gate.stats,
+        limits: {
+          min_deposit: MIN_DEPOSIT_BEFORE_WITHDRAW,
+          min_games: MIN_GAMES_BEFORE_WITHDRAW,
+          keep_balance: WITHDRAW_KEEP_BALANCE
+        }
+      });
+    }
     const balances = await creditPlayerBalances(player_id, { mainAdd: -Number(amount), type: 'withdrawal', notes: `Withdraw ${amount}` });
     if (supabase) {
       try {
@@ -1572,6 +1798,12 @@ app.post('/api/wallet/withdraw-request', async (req, res) => {
         }]);
       } catch (e) {}
     }
+    await notifyPlayer(player_id, T.notifyWithdrawPending
+      .replace('{amt}', String(amount))
+      .replace('{acct}', account_number || '-')
+      .replace('{bal}', String(balances ? balances.balance : '?')));
+    await notifyAdmin(`\ud83d\udd14 <b>New Withdrawal (app)</b>\nPlayer: <code>${player_id}</code>\nAmount: <b>${amount} ETB</b>\nTo: <code>${account_number || '-'}</code>`);
+
     res.json({ success: true, balances });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -1681,13 +1913,20 @@ app.post('/api/admin/deposits/:id/approve', requireAdmin, async (req, res) => {
   if (!player_id || !amount) return res.status(404).json({ error: 'Deposit not found' });
   if (rec && rec.status !== 'pending') return res.status(400).json({ error: `Already ${rec.status}` });
 
-  const bonus = Math.floor(amount * DEPOSIT_BONUS_PCT);
+  // First deposit gets the matched bonus (capped); later ones the normal rate.
+  const stats = await getPlayerStats(player_id);
+  const isFirst = stats.deposits === 0;
+  const bonus = isFirst
+    ? Math.min(Math.floor(amount * FIRST_DEPOSIT_BONUS_PCT), FIRST_DEPOSIT_BONUS_CAP)
+    : Math.floor(amount * DEPOSIT_BONUS_PCT);
+  console.log(`\ud83d\udcb0 deposit ${amount} | ${isFirst ? 'FIRST' : 'repeat'} | bonus ${bonus}`);
   const balances = await creditPlayerBalances(player_id, {
     mainAdd: amount, playAdd: bonus, type: 'deposit',
-    notes: `Deposit ${method || ''} #${id}${bonus ? ` (+${bonus} bonus)` : ''}`
+    notes: `Deposit ${method || ''} #${id}${bonus ? ` (+${bonus} ${isFirst ? 'first-deposit ' : ''}bonus)` : ''}`
   });
   if (!balances) return res.status(404).json({ error: 'Player not found' });
 
+  bumpStats(player_id, { deposited: amount, deposits: 1 });
   if (rec) rec.status = 'approved';
   if (supabase) {
     try { await supabase.from('deposit_requests').update({ status: 'approved' })
@@ -1949,6 +2188,70 @@ function startNewRound() {
   broadcastTick();
 }
 
+// Fill a thin lobby with house cartelas so the round feels alive. They pay no
+// entry fee (so they add nothing to the pot) and are removed each round.
+function addHousePlayers() {
+  if (!HOUSE_ENABLED) return;
+  const parts = participantsOf(currentActiveGameRoundId);
+  const realCount = Array.from(parts.values()).filter(p => !p.is_house).length;
+
+  // Enough humans turned up - pull the house cartelas back out so real players
+  // never compete against them unnecessarily.
+  if (realCount >= HOUSE_MIN_REAL_PLAYERS) {
+    let removed = 0;
+    for (const [k, v] of Array.from(parts.entries())) {
+      if (v.is_house) { parts.delete(k); removed++; }
+    }
+    if (removed) console.log(`\ud83e\udd16 removed ${removed} house cartelas (${realCount} real players)`);
+    return;
+  }
+
+  // Already seeded for this round - don't add a second set.
+  if (Array.from(parts.values()).some(p => p.is_house)) return;
+
+  if (realCount < 1) return;   // nobody real yet, nothing to dress up
+
+  const taken = new Set();
+  parts.forEach(p => (p.cards || []).forEach(c => taken.add(Number(c))));
+
+  HOUSE_NAMES.forEach((name, i) => {
+    let card = 0, tries = 0;
+    do { card = 1 + Math.floor(Math.random() * 150); tries++; }
+    while (taken.has(card) && tries < 300);
+    if (taken.has(card)) return;
+    taken.add(card);
+    parts.set(`house_${i}_${currentActiveGameRoundId}`, {
+      purchased_cards: 1,
+      cards: [card],
+      username: name,
+      is_house: true
+    });
+  });
+  console.log(`\ud83e\udd16 house cartelas: ${HOUSE_NAMES.join(', ')} (real players: ${realCount})`);
+}
+
+// A house cartela completing a line ends the round like any other win, but no
+// money is paid out - there's no account behind it.
+function checkHouseBingo() {
+  const parts = participantsOf(currentActiveGameRoundId);
+  for (const [pid, p] of parts.entries()) {
+    if (!p.is_house) continue;
+    if (currentRoundWinners.some(w => w.player_id === pid)) continue;
+    for (const c of (p.cards || [])) {
+      if (winningLineCells(Number(c), drawnBallsHistory).length) {
+        currentRoundWinners.push({
+          player_id: pid, username: p.username, cardNum: c, is_house: true
+        });
+        console.log(`\ud83e\udd16 house bingo: ${p.username} card #${c}`);
+        if (!resolveTimer) {
+          resolveTimer = setTimeout(() => { resolveTimer = null; resolveRoundWinners(); }, 1200);
+        }
+        return;
+      }
+    }
+  }
+}
+
 function startBallDrawing() {
   if (gameBallInterval) clearInterval(gameBallInterval);
   gameBallInterval = setInterval(() => {
@@ -1963,6 +2266,7 @@ function startBallDrawing() {
     ballPool = ballPool.filter(n => n !== num);
     drawnBallsHistory.push(num);
     io.emit('ball_drawn', { number: num, pool: drawnBallsHistory });
+    checkHouseBingo();
   }, 3000);
 }
 
@@ -2003,6 +2307,7 @@ async function resolveRoundWinners() {
   const payout = Math.floor(currentRoundPot / currentRoundWinners.length);
   const paid = {};
   for (const winner of currentRoundWinners) {
+    if (winner.is_house) continue;   // no account, no payout
     const bal = await creditPlayerBalances(winner.player_id, { mainAdd: payout, type: 'payout', game_id: currentActiveGameRoundId, notes: `Bingo! Card #${winner.cardNum}` });
     if (bal) paid[winner.player_id] = bal;
     if (supabase) {
@@ -2012,7 +2317,9 @@ async function resolveRoundWinners() {
       } catch (e) {}
     }
   }
+  const houseWon = currentRoundWinners.every(w => w.is_house);
   io.emit('opponent_victory', {
+    houseWon,
     winnerName: currentRoundWinners.map(w => w.username).join(', '),
     cardNum: currentRoundWinners[0].cardNum,
     winnerPlayerId: currentRoundWinners[0].player_id,
@@ -2040,14 +2347,21 @@ setInterval(() => {
     if (globalGameState === "waiting") {
       timeRemaining--;
       if (timeRemaining <= 0) {
+        // House cartelas are added BEFORE this check so a single real player
+        // can start a round (the lobby should never look empty).
+        addHousePlayers();
         const count = participantsOf(currentActiveGameRoundId).size;
-        if (count < MIN_PLAYERS_TO_START) {
+        const realCount = Array.from(participantsOf(currentActiveGameRoundId).values())
+          .filter(p => !p.is_house).length;
+        if (realCount < 1 || count < MIN_PLAYERS_TO_START) {
           console.log(`⏳ Players: ${count}/${MIN_PLAYERS_TO_START}, restarting wait...`);
           timeRemaining = RECHECK_WAIT_SECONDS;
         } else {
-          console.log(`🎮 Starting game with ${count} players!`);
+          console.log(`🎮 Starting game with ${participantsOf(currentActiveGameRoundId).size} players!`);
           globalGameState = "playing";
           resetBallPool();
+          // Pot INCLUDES house cartelas so the derash looks full. The house
+          // funds the difference when a real player wins - see HOUSE_NOTE.
           const totalCards = Array.from(participantsOf(currentActiveGameRoundId).values())
             .reduce((s, p) => s + (Number(p.purchased_cards) || 0), 0);
           currentRoundPot = totalCards * (CARD_PRICE - HOUSE_FEE_PER_CARD);

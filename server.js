@@ -125,10 +125,14 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PLAYERS_FILE = path.join(DATA_DIR, 'players.json');
 const TOKENS_FILE = path.join(DATA_DIR, 'tokens.json');
 const STATS_FILE = path.join(DATA_DIR, 'stats.json');
+const RECEIPTS_FILE = path.join(DATA_DIR, 'receipts.json');
 const PHONES_FILE = path.join(DATA_DIR, 'phones.json');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 
 const statsCache = new Map();    // player_id -> { deposited, games, deposits }
+// receipt ref -> { player_id, status, at }. Must be declared before loadDisk()
+// runs, or the restore silently throws on the temporal dead zone.
+const usedReceipts = new Map();
 const loginTokens = new Map();   // token -> { tid, created }
 const tidToToken = new Map();    // tid   -> token
 const inMemoryPlayers = new Map();        // player_id -> player
@@ -162,6 +166,11 @@ function loadDisk() {
     Object.entries(raw || {}).forEach(([k, v]) => statsCache.set(k, v));
   } catch (e) {}
   try {
+    const raw = JSON.parse(fs.readFileSync(RECEIPTS_FILE, 'utf8'));
+    Object.entries(raw || {}).forEach(([k, v]) => usedReceipts.set(k, v));
+    console.log(`\ud83e\uddfe Loaded ${usedReceipts.size} used receipt refs`);
+  } catch (e) {}
+  try {
     const raw = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
     Object.entries(raw || {}).forEach(([tok, tid]) => {
       loginTokens.set(tok, { tid: String(tid), created: 0 });
@@ -182,6 +191,7 @@ function flushDisk() {
       fs.writeFileSync(TOKENS_FILE, JSON.stringify(t));
     } catch (e) {}
     try { fs.writeFileSync(STATS_FILE, JSON.stringify(Object.fromEntries(statsCache))); } catch (e) {}
+    try { fs.writeFileSync(RECEIPTS_FILE, JSON.stringify(Object.fromEntries(usedReceipts))); } catch (e) {}
   }, 400);
 }
 loadDisk();
@@ -356,6 +366,22 @@ async function creditPlayerBalances(player_id, { mainAdd = 0, playAdd = 0, type,
   return { main_balance: newMain, play_balance: newPlay, balance: newMain + newPlay };
 }
 
+// Pull the transaction/receipt number out of a pasted confirmation SMS.
+// Telebirr refs look like "CJ12AB34CD", CBE like "FT25123456789" - generally a
+// run of 8+ alphanumerics containing at least one digit. Falls back to a hash
+// of the whole message so an identical paste is still caught.
+function extractReceiptRef(sms) {
+  const text = String(sms || '').toUpperCase();
+  const candidates = text.match(/\b[A-Z0-9]{8,}\b/g) || [];
+  const withDigit = candidates.filter(c => /\d/.test(c));
+  // Longest match is usually the transaction id rather than a phone number.
+  withDigit.sort((a, b) => b.length - a.length);
+  if (withDigit.length) return withDigit[0];
+  const norm = text.replace(/\s+/g, ' ').trim();
+  if (!norm) return null;
+  return 'H' + crypto.createHash('sha256').update(norm).digest('hex').slice(0, 16).toUpperCase();
+}
+
 // Lifetime totals used by the withdrawal gates.
 // In-memory mirror of the lifetime stats, so the withdrawal gates still work
 // if Supabase is unavailable. Without this a DB blip would lock every player
@@ -452,7 +478,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'admin-sync-2026-08-06';
+const BUILD_ID = 'receipt-dedupe-2026-08-06';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {
@@ -728,6 +754,12 @@ const T = {
     "💰 <b>{method}</b>\n\n💳 መጠን: <b>{amt} ብር</b>\n🏦 ሂሳብ ቁጥር: <code>{acct}</code>\n\n" +
     "<b>ደረጃዎች:</b>\n1. ከላይ ወዳለው ሂሳብ {amt} ብር ይላኩ\n2. የማረጋገጫ ኤስኤምኤስ ይደርስዎታል\n" +
     "3. ያንን ኤስኤምኤስ ኮፒ አድርገው እዚህ ይለጥፉ\n\nኤስኤምኤሱን አሁን ይለጥፉ:",
+  depDuplicate:
+    "🚫 <b>ይህ ደረሰኝ ቀድሞ ገብቷል!</b>\n\n" +
+    "የግብይት ቁጥር: <code>{ref}</code>\n\n" +
+    "አንድ ደረሰኝ አንድ ጊዜ ብቻ ነው የሚያገለግለው።\n" +
+    "እባክዎ አዲስ ክፍያ ፈጽመው አዲሱን ኤስኤምኤስ ይለጥፉ።\n\n" +
+    "⚠️ ተደጋጋሚ ሙከራ መለያዎ እንዲታገድ ያደርጋል።",
   depDone: "✅ <b>ጥያቄዎ ደርሶናል!</b>\n\nመጠን: <b>{amt} ብር</b>\nሁኔታ: ⏳ በመጠባበቅ ላይ\n\nከተረጋገጠ በኋላ ወደ ሂሳብዎ ይገባል።",
   depApproved: "✅ <b>ተቀባይነት አግኝቷል!</b>\n\nመጠን: <b>{amt} ብር</b>\nአዲስ ቀሪ ሂሳብ: <b>{bal} ብር</b>\n\nመልካም ጨዋታ! 🎮",
   depRejected: "❌ <b>ተቀባይነት አላገኘም</b>\n\nመጠን: <b>{amt} ብር</b>\n\nለበለጠ መረጃ ድጋፍን ያግኙ።",
@@ -1048,17 +1080,43 @@ async function handleConversation(chatId, tid, text, player) {
 
   if (st.step === 'dep_sms') {
     const { amount, method } = st.data;
+
+    // REJECT A REUSED RECEIPT. Without this the same Telebirr SMS could be
+    // pasted repeatedly and credited every time.
+    const receiptRef = extractReceiptRef(text);
+    if (receiptRef && usedReceipts.has(receiptRef)) {
+      const prev = usedReceipts.get(receiptRef);
+      clearConv(tid);
+      console.warn(`\ud83d\udea8 duplicate receipt ${receiptRef} from ${player.player_id} (first used by ${prev.player_id})`);
+      await tgSend(chatId, T.depDuplicate.replace('{ref}', receiptRef), mainMenuKeyboard(tid));
+      await notifyAdmin(
+        `\ud83d\udea8 <b>DUPLICATE RECEIPT BLOCKED</b>\n\n` +
+        `User: ${player.username} (<code>${tid}</code>)\n` +
+        `Ref: <code>${receiptRef}</code>\n` +
+        `Originally used by: <code>${prev.player_id}</code>\n` +
+        `Claimed amount: ${amount} ETB`);
+      return true;
+    }
+
     const id = ++depositSeq;
     const rec = {
       id, player_id: player.player_id, telegram_id: String(tid), chat_id: chatId,
       amount, method, sms: String(text).slice(0, 800),
+      receipt_ref: receiptRef,
       status: 'pending', created_at: new Date().toISOString()
     };
     pendingDeposits.set(id, rec);
+    if (receiptRef) {
+      usedReceipts.set(receiptRef, {
+        player_id: player.player_id, status: 'pending', at: rec.created_at
+      });
+      flushDisk();
+    }
     if (supabase) {
       try {
         const { error } = await supabase.from('deposit_requests').insert([{
-          player_id: rec.player_id, method, amount, reference_id: String(id),
+          player_id: rec.player_id, method, amount,
+          reference_id: receiptRef || String(id),
           status: 'pending', requested_at: rec.created_at
         }]);
         // Was a silent catch: the bot kept its own copy so it looked fine,
@@ -1072,7 +1130,8 @@ async function handleConversation(chatId, tid, text, player) {
     await tgSend(chatId, T.depDone.replace('{amt}', String(amount)), mainMenuKeyboard(tid));
     await notifyAdmin(
       `🔔 <b>New Deposit</b>\n\nUser: ${player.username}\nTG: <code>${tid}</code>\n` +
-      `Amount: <b>${amount} ETB</b>\nMethod: ${method}\nRef: <code>${id}</code>\n\n` +
+      `Amount: <b>${amount} ETB</b>\nMethod: ${method}\n` +
+      `Receipt: <code>${receiptRef || 'not detected'}</code>\nRef: <code>${id}</code>\n\n` +
       `SMS:\n<code>${String(text).slice(0, 400)}</code>\n\n` +
       `✅ /approve_${id}\n❌ /reject_${id}`);
     return true;
@@ -1918,7 +1977,8 @@ app.get('/api/admin/deposits', requireAdmin, async (req, res) => {
   // In-memory first (bot flow), then DB rows.
   pendingDeposits.forEach(d => seen.set(String(d.id), {
     id: d.id, player_id: d.player_id, method: d.method, amount: d.amount,
-    reference_id: d.sms ? String(d.sms).slice(0, 60) : String(d.id),
+    reference_id: d.receipt_ref || (d.sms ? String(d.sms).slice(0, 60) : String(d.id)),
+    sms: d.sms,
     status: d.status, requested_at: d.created_at
   }));
   if (supabase) {
@@ -1971,7 +2031,13 @@ app.post('/api/admin/deposits/:id/approve', requireAdmin, async (req, res) => {
   if (!balances) return res.status(404).json({ error: 'Player not found' });
 
   bumpStats(player_id, { deposited: amount, deposits: 1 });
-  if (rec) rec.status = 'approved';
+  if (rec) {
+    rec.status = 'approved';
+    if (rec.receipt_ref) {
+      usedReceipts.set(rec.receipt_ref, { player_id, status: 'approved', at: new Date().toISOString() });
+      flushDisk();
+    }
+  }
   if (supabase) {
     try { await supabase.from('deposit_requests').update({ status: 'approved' })
       .or(`reference_id.eq.${id},id.eq.${id}`); } catch (e) {}
@@ -1987,7 +2053,11 @@ app.post('/api/admin/deposits/:id/approve', requireAdmin, async (req, res) => {
 app.post('/api/admin/deposits/:id/reject', requireAdmin, async (req, res) => {
   const id = req.params.id;
   const rec = pendingDeposits.get(Number(id)) || pendingDeposits.get(id);
-  if (rec) rec.status = 'rejected';
+  if (rec) {
+    rec.status = 'rejected';
+    // Free the receipt so a genuine re-submission isn't blocked forever.
+    if (rec.receipt_ref) { usedReceipts.delete(rec.receipt_ref); flushDisk(); }
+  }
   if (supabase) {
     try { await supabase.from('deposit_requests').update({ status: 'rejected' })
       .or(`reference_id.eq.${id},id.eq.${id}`); } catch (e) {}

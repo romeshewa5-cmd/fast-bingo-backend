@@ -95,6 +95,12 @@ const FIRST_DEPOSIT_BONUS_CAP = Number(process.env.FIRST_DEPOSIT_BONUS_CAP) || 2
 const MIN_DEPOSIT_BEFORE_WITHDRAW = Number(process.env.MIN_DEPOSIT_BEFORE_WITHDRAW) || 50;
 const MIN_GAMES_BEFORE_WITHDRAW = Number(process.env.MIN_GAMES_BEFORE_WITHDRAW) || 5;
 const WITHDRAW_KEEP_BALANCE = Number(process.env.WITHDRAW_KEEP_BALANCE) || 50;
+// HARD RESERVE: this much must ALWAYS stay in the main wallet. It can never be
+// withdrawn - a player can only ever take out (main_balance - reserve).
+const MIN_WALLET_RESERVE = Number(process.env.MIN_WALLET_RESERVE ?? 50);
+// When the reserve is active the "keep enough" alternative is always satisfied,
+// which would silently disable the games rule. Set true to require games too.
+const WITHDRAW_REQUIRE_GAMES = String(process.env.WITHDRAW_REQUIRE_GAMES || 'false') === 'true';
 const CARD_PRICE = Number(process.env.CARD_PRICE) || 10;
 const PAYOUT_PERCENTAGE = Number(process.env.PAYOUT_PERCENTAGE) || 0.8;
 // House keeps a flat fee per card; the rest goes to the winner(s).
@@ -267,6 +273,23 @@ function verifyInitData(initData) {
   }
 }
 
+// Reduce any Ethiopian number to one canonical form: +2519XXXXXXXX.
+// "0926710936", "251926710936", "+251 92 671 0936" and "926710936" are all
+// the same person - storing them verbatim let one player register repeatedly
+// and collect the signup bonus each time.
+function normalizePhone(raw) {
+  if (!raw) return null;
+  let d = String(raw).replace(/[^\d]/g, '');   // digits only
+  if (!d) return null;
+  if (d.startsWith('00')) d = d.slice(2);       // 00251... -> 251...
+  if (d.startsWith('251')) d = d.slice(3);      // country code off
+  else if (d.startsWith('0')) d = d.slice(1);   // national trunk 0 off
+  // Ethiopian mobile numbers are 9 digits starting with 9 or 7.
+  if (d.length > 9) d = d.slice(-9);
+  if (d.length !== 9) return '+' + String(raw).replace(/[^\d]/g, '');  // unknown shape - keep as-is
+  return '+251' + d;
+}
+
 function sanitizePlayer(p) {
   if (!p) return null;
   const main = Number(p.main_balance ?? p.balance ?? 0);
@@ -296,14 +319,29 @@ async function findPlayerByTelegramId(telegram_id) {
 }
 async function findPlayerByPhone(phone_number) {
   if (!phone_number) return null;
+  const canon = normalizePhone(phone_number);
+  // Try every shape the number may have been stored in historically.
+  const digits = String(canon || phone_number).replace(/[^\d]/g, '');
+  const local9 = digits.slice(-9);
+  const variants = [...new Set([
+    canon, phone_number, String(phone_number).trim(),
+    '+251' + local9, '251' + local9, '0' + local9, local9,
+    '+' + local9, '+0' + local9
+  ].filter(Boolean))];
+
   if (supabase) {
-    try {
-      const { data } = await supabase.from('players').select('*').eq('phone_number', phone_number).maybeSingle();
-      if (data) { cachePlayer(data); return data; }
-    } catch (e) {}
+    for (const v of variants) {
+      try {
+        const { data } = await supabase.from('players').select('*').eq('phone_number', v).maybeSingle();
+        if (data) { cachePlayer(data); return data; }
+      } catch (e) {}
+    }
   }
-  const pId = inMemoryPhoneToId.get(String(phone_number));
-  return pId ? inMemoryPlayers.get(pId) || null : null;
+  for (const v of variants) {
+    const pId = inMemoryPhoneToId.get(String(v));
+    if (pId && inMemoryPlayers.has(pId)) return inMemoryPlayers.get(pId);
+  }
+  return null;
 }
 async function findPlayerById(player_id) {
   if (!player_id) return null;
@@ -318,7 +356,13 @@ async function findPlayerById(player_id) {
 function cachePlayer(p) {
   if (!p || !p.player_id) return;
   inMemoryPlayers.set(p.player_id, p);
-  if (p.phone_number) inMemoryPhoneToId.set(String(p.phone_number), p.player_id);
+  if (p.phone_number) {
+    inMemoryPhoneToId.set(String(p.phone_number), p.player_id);
+    // Index the canonical form too, so a differently-formatted login still
+    // resolves to this same account.
+    const canon = normalizePhone(p.phone_number);
+    if (canon) inMemoryPhoneToId.set(canon, p.player_id);
+  }
   if (p.telegram_id) inMemoryTgToId.set(String(p.telegram_id), p.player_id);
   flushDisk();
 }
@@ -424,14 +468,30 @@ async function getPlayerStats(player_id) {
 async function checkWithdrawEligibility(player_id, amount, mainBalanceAfter) {
   const st = await getPlayerStats(player_id);
 
+  // RULE 1 - hard reserve. Checked first because it is absolute: this amount
+  // can never leave the wallet, whatever else the player has done.
+  if (MIN_WALLET_RESERVE > 0 && mainBalanceAfter < MIN_WALLET_RESERVE) {
+    return {
+      ok: false, reason: 'below_reserve',
+      reserve: MIN_WALLET_RESERVE,
+      would_leave: mainBalanceAfter,
+      max_withdrawable: Math.max(0, (mainBalanceAfter + Number(amount)) - MIN_WALLET_RESERVE),
+      stats: st
+    };
+  }
+
+  // RULE 2 - must have deposited real money.
   if (st.deposited < MIN_DEPOSIT_BEFORE_WITHDRAW) {
     return { ok: false, reason: 'need_deposit',
              need: MIN_DEPOSIT_BEFORE_WITHDRAW - st.deposited, stats: st };
   }
-  // Either enough games played, OR enough left behind in the wallet.
+
+  // RULE 3 - games played. With a reserve in force "keeps enough" is always
+  // true, so the OR form would never block anything; WITHDRAW_REQUIRE_GAMES
+  // makes it a genuine requirement.
   const playedEnough = st.games >= MIN_GAMES_BEFORE_WITHDRAW;
   const keepsEnough = mainBalanceAfter >= WITHDRAW_KEEP_BALANCE;
-  if (!playedEnough && !keepsEnough) {
+  if (!playedEnough && (WITHDRAW_REQUIRE_GAMES || !keepsEnough)) {
     return { ok: false, reason: 'need_games',
              need: MIN_GAMES_BEFORE_WITHDRAW - st.games, stats: st };
   }
@@ -515,7 +575,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'withdraw-marks-2026-08-06';
+const BUILD_ID = 'phone-dedupe-2026-08-06';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {
@@ -528,6 +588,7 @@ app.get('/api/config', (req, res) => {
     min_deposit_before_withdraw: MIN_DEPOSIT_BEFORE_WITHDRAW,
     min_games_before_withdraw: MIN_GAMES_BEFORE_WITHDRAW,
     withdraw_keep_balance: WITHDRAW_KEEP_BALANCE,
+    min_wallet_reserve: MIN_WALLET_RESERVE,
     first_deposit_bonus_pct: FIRST_DEPOSIT_BONUS_PCT,
     first_deposit_bonus_cap: FIRST_DEPOSIT_BONUS_CAP
   });
@@ -674,10 +735,28 @@ async function payReferrer(newPlayer) {
 }
 
 async function createPlayer({ username, phone_number, telegram_id, referrer_id }) {
+  phone_number = normalizePhone(phone_number) || phone_number;
+
+  // Guard 1: same telegram account already registered.
+  if (telegram_id) {
+    const byTg = await findPlayerByTelegramId(telegram_id);
+    if (byTg) {
+      console.log("\u267b\ufe0f createPlayer: telegram_id already registered, reusing", byTg.player_id);
+      return byTg;
+    }
+  }
+  // Guard 2: same phone already registered (any format).
   const existingByPhone = await findPlayerByPhone(phone_number);
   if (existingByPhone) {
-    return await savePlayer({ ...existingByPhone, telegram_id: telegram_id || existingByPhone.telegram_id, username });
+    console.log(`\u267b\ufe0f createPlayer: phone ${phone_number} already belongs to ${existingByPhone.player_id} - reusing (no new bonus)`);
+    return await savePlayer({
+      ...existingByPhone,
+      phone_number,                                   // upgrade to canonical
+      telegram_id: telegram_id || existingByPhone.telegram_id,
+      username
+    });
   }
+  console.log(`\u2795 createPlayer: NEW account for ${phone_number} (+${SIGNUP_BONUS} ETB signup bonus)`);
   // players.player_id is a UUID column in Supabase - a "p_<ts>_<rand>" string
   // is rejected with: invalid input syntax for type uuid.
   const playerId = crypto.randomUUID();
@@ -800,7 +879,7 @@ const T = {
   depDone: "✅ <b>ጥያቄዎ ደርሶናል!</b>\n\nመጠን: <b>{amt} ብር</b>\nሁኔታ: ⏳ በመጠባበቅ ላይ\n\nከተረጋገጠ በኋላ ወደ ሂሳብዎ ይገባል።",
   depApproved: "✅ <b>ተቀባይነት አግኝቷል!</b>\n\nመጠን: <b>{amt} ብር</b>\nአዲስ ቀሪ ሂሳብ: <b>{bal} ብር</b>\n\nመልካም ጨዋታ! 🎮",
   depRejected: "❌ <b>ተቀባይነት አላገኘም</b>\n\nመጠን: <b>{amt} ብር</b>\n\nለበለጠ መረጃ ድጋፍን ያግኙ።",
-  wdAsk: "📤 ገንዘብ ማውጣት\n\n💰 የሚወጣ ቀሪ ሂሳብ: <b>{bal} ብር</b>\nዝቅተኛ: {min} ብር\n\nመጠኑን ይጻፉ:",
+  wdAsk: "📤 ገንዘብ ማውጣት\n\n💰 ቀሪ ሂሳብ: <b>{bal} ብር</b>\n🔒 መቆየት ያለበት: <b>{reserve} ብር</b>\n✅ ማውጣት የሚችሉት: <b>{max} ብር</b>\n\nዝቅተኛ የማውጫ መጠን: {min} ብር\n\nመጠኑን ይጻፉ:",
   wdMin: "❌ ዝቅተኛው {min} ብር ነው:",
   wdNoFunds: "❌ በቂ ሂሳብ የለዎትም። የሚወጣ: {bal} ብር\n\n(የቦነስ ገንዘብ ማውጣት አይቻልም)",
   wdPhone: "የቴሌብር ስልክ ቁጥርዎን ያስገቡ:",
@@ -810,6 +889,12 @@ const T = {
     "እስካሁን ያስገቡት: <b>{done} ብር</b>\n" +
     "የቀረው: <b>{need} ብር</b>\n\n" +
     "🏦 «Add Funds» ተጭነው ገንዘብ ያስገቡ።",
+  wdBelowReserve:
+    "🔒 <b>ገንዘብ ማውጣት አይቻልም</b>\n\n" +
+    "በሂሳብዎ ውስጥ ሁልጊዜ ቢያንስ <b>{reserve} ብር</b> መቆየት አለበት።\n\n" +
+    "💰 አሁን ያለዎት: <b>{bal} ብር</b>\n" +
+    "✅ ማውጣት የሚችሉት: <b>{max} ብር</b>\n\n" +
+    "እባክዎ {max} ብር ወይም ከዚያ በታች ይሞክሩ።",
   wdNeedGames:
     "🔒 <b>ገንዘብ ማውጣት አይቻልም</b>\n\n" +
     "ለማውጣት ከሚከተሉት አንዱን ማሟላት አለብዎት፦\n\n" +
@@ -946,8 +1031,7 @@ app.post('/api/telegram/webhook', async (req, res) => {
 
     // ---- STEP 1: contact shared ----
     if (msg.contact && String(msg.contact.user_id) === tid) {
-      let phone = String(msg.contact.phone_number || '').replace(/\s/g, '');
-      if (phone && !phone.startsWith('+')) phone = '+' + phone;
+      const phone = normalizePhone(msg.contact.phone_number);
       tgPhoneBook.set(tid, phone);
       flushDisk();
       console.log("\ud83d\udcde Contact stored for", tid, phone);
@@ -1211,7 +1295,12 @@ async function handleConversation(chatId, tid, text, player) {
       player.player_id, amount, fsp.main_balance - amount);
     if (!gate.ok) {
       clearConv(tid);
-      const msg = gate.reason === 'need_deposit'
+      const msg = gate.reason === 'below_reserve'
+        ? T.wdBelowReserve
+            .replace(/{reserve}/g, String(gate.reserve))
+            .replace('{bal}', String(fsp.main_balance))
+            .replace(/{max}/g, String(gate.max_withdrawable))
+        : gate.reason === 'need_deposit'
         ? T.wdNeedDeposit
             .replace('{min}', String(MIN_DEPOSIT_BEFORE_WITHDRAW))
             .replace('{done}', String(gate.stats.deposited))
@@ -1301,6 +1390,8 @@ async function handleMenuText(chatId, tid, text) {
     setConv(tid, 'wd_amount', {});
     await tgSend(chatId, T.wdAsk
       .replace('{bal}', String(sp.main_balance))
+      .replace('{reserve}', String(MIN_WALLET_RESERVE))
+      .replace('{max}', String(Math.max(0, sp.main_balance - MIN_WALLET_RESERVE)))
       .replace('{min}', String(MIN_WITHDRAWAL_AMOUNT)), cancelKb());
   } else if (text.includes('Transactions') || text.includes('\u130d\u1265\u12ed\u1276\u127d') || text === '/transactions') {
     await sendTransactions(chatId, player);
@@ -2772,6 +2863,11 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`✈️ TG_GROUP_LINK: ${TG_GROUP_LINK || 'NOT SET'}`);
   console.log(`👤 ADMIN_ID: ${ADMIN_ID || 'NOT SET - /promo and /approve will not work'}`);
   console.log(`🖼️ PROMO_IMAGE_URL: ${PROMO_IMAGE_URL || '(none - text-only posts)'}`);
+  console.log(`🎁 First deposit bonus: ${Math.round(FIRST_DEPOSIT_BONUS_PCT*100)}% up to ${FIRST_DEPOSIT_BONUS_CAP} ETB | repeat: ${Math.round(DEPOSIT_BONUS_PCT*100)}%`);
+  console.log(`🔐 Locked reserve: ${MIN_WALLET_RESERVE} ETB must always remain in the main wallet`);
+  console.log(`🔒 Withdraw gates: deposit >=${MIN_DEPOSIT_BEFORE_WITHDRAW} ETB` +
+    (WITHDRAW_REQUIRE_GAMES ? ` AND >=${MIN_GAMES_BEFORE_WITHDRAW} games`
+                            : ` AND (>=${MIN_GAMES_BEFORE_WITHDRAW} games OR keep >=${WITHDRAW_KEEP_BALANCE} ETB)`));
 
   if (PROMO_ENABLED && PROMO_CHAT_ID) {
     console.log(`📢 Auto-promo ON: every ${PROMO_INTERVAL_MIN} min to ${PROMO_CHAT_ID}`);

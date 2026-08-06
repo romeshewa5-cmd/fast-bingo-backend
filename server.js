@@ -83,7 +83,13 @@ const CBE_NUMBER = (process.env.CBE_NUMBER || '').trim();
 const MIN_DEPOSIT_AMOUNT = Number(process.env.MIN_DEPOSIT_AMOUNT) || 50;
 // First-deposit bonus: 100% matched, capped so one big deposit can't drain the
 // float. Every later deposit falls back to DEPOSIT_BONUS_PCT.
-const FIRST_DEPOSIT_BONUS_PCT = Number(process.env.FIRST_DEPOSIT_BONUS_PCT ?? 1.0);
+// Guard against a bad env value. Number('abc') is NaN, and NaN silently
+// poisons the bonus maths (Math.floor(amount * NaN) = NaN). Also accept "100"
+// meaning 100% rather than a 100x multiplier.
+let _fdb = Number(process.env.FIRST_DEPOSIT_BONUS_PCT);
+if (!Number.isFinite(_fdb) || _fdb < 0) _fdb = 1.0;
+if (_fdb > 5) _fdb = _fdb / 100;          // someone typed 100 instead of 1.0
+const FIRST_DEPOSIT_BONUS_PCT = _fdb;
 const FIRST_DEPOSIT_BONUS_CAP = Number(process.env.FIRST_DEPOSIT_BONUS_CAP) || 200;
 // Withdrawal gates - stop bonus money being cashed out without real play.
 const MIN_DEPOSIT_BEFORE_WITHDRAW = Number(process.env.MIN_DEPOSIT_BEFORE_WITHDRAW) || 50;
@@ -446,7 +452,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'spectator-2026-08-05';
+const BUILD_ID = 'admin-sync-2026-08-06';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {
@@ -998,6 +1004,9 @@ function getConv(tid) { return convState.get(String(tid)) || null; }
 function clearConv(tid) { convState.delete(String(tid)); }
 
 const pendingDeposits = new Map();  // id -> record
+const pendingWithdrawals = new Map();  // id -> record (mirror, so the admin
+// page still lists bot-side requests when Supabase rejects the insert)
+let withdrawalSeq = (Date.now() % 100000) + 500000;
 let depositSeq = Date.now() % 100000;
 
 function cancelKb() { return { keyboard: [[{ text: T.btnCancel }]], resize_keyboard: true }; }
@@ -1047,10 +1056,17 @@ async function handleConversation(chatId, tid, text, player) {
     };
     pendingDeposits.set(id, rec);
     if (supabase) {
-      try { await supabase.from('deposit_requests').insert([{
-        player_id: rec.player_id, method, amount, reference_id: String(id),
-        status: 'pending', requested_at: rec.created_at
-      }]); } catch (e) {}
+      try {
+        const { error } = await supabase.from('deposit_requests').insert([{
+          player_id: rec.player_id, method, amount, reference_id: String(id),
+          status: 'pending', requested_at: rec.created_at
+        }]);
+        // Was a silent catch: the bot kept its own copy so it looked fine,
+        // while the admin page (which reads Supabase) saw nothing.
+        if (error) console.error("\u274c deposit_requests insert failed:", error.message,
+          "|", error.details || '', "|", error.hint || '');
+        else rec.synced = true;
+      } catch (e) { console.error("\u274c deposit_requests insert threw:", e.message); }
     }
     clearConv(tid);
     await tgSend(chatId, T.depDone.replace('{amt}', String(amount)), mainMenuKeyboard(tid));
@@ -1111,11 +1127,24 @@ async function handleConversation(chatId, tid, text, player) {
     const balances = await creditPlayerBalances(player.player_id, {
       mainAdd: -amount, type: 'withdrawal', notes: `Withdraw to ${phone}`
     });
+    const wdRec = {
+      id: ++withdrawalSeq, player_id: player.player_id, amount,
+      method: 'Telebirr', account_number: phone, account_name: player.username || '',
+      status: 'pending', requested_at: new Date().toISOString(),
+      telegram_id: String(tid), chat_id: chatId
+    };
+    pendingWithdrawals.set(wdRec.id, wdRec);
+
     if (supabase) {
-      try { await supabase.from('withdrawal_requests').insert([{
-        player_id: player.player_id, amount, method: 'Telebirr', account_number: phone,
-        account_name: player.username || '', status: 'pending', requested_at: new Date().toISOString()
-      }]); } catch (e) {}
+      try {
+        const { error } = await supabase.from('withdrawal_requests').insert([{
+          player_id: player.player_id, amount, method: 'Telebirr', account_number: phone,
+          account_name: player.username || '', status: 'pending', requested_at: wdRec.requested_at
+        }]);
+        if (error) console.error("\u274c withdrawal_requests insert failed:", error.message,
+          "|", error.details || '', "|", error.hint || '');
+        else wdRec.synced = true;
+      } catch (e) { console.error("\u274c withdrawal_requests insert threw:", e.message); }
     }
     clearConv(tid);
     await tgSend(chatId, T.wdDone.replace('{amt}', String(amount)).replace('{phone}', phone), mainMenuKeyboard(tid));
@@ -1602,7 +1631,13 @@ app.post('/api/games/create', async (req, res) => {
 
     if (supabase) {
       try {
-        await ensureRoundRow(game_id);   // parent row must exist first
+        const roundReady = await ensureRoundRow(game_id);
+        if (!roundReady) {
+          // The round is still valid in memory - the player keeps their card
+          // and their money. We just can't mirror it to Supabase this time.
+          console.warn("\u26a0\ufe0f skipping game_participants insert - rounds row unavailable");
+          throw { skip: true };
+        }
         const base = { player_id, game_id, purchased_cards: Number(cards_bought), is_winner: false };
         let { error } = await supabase.from('game_participants')
           .insert([{ ...base, metadata: { cards: wanted } }]);
@@ -1618,7 +1653,9 @@ app.post('/api/games/create', async (req, res) => {
           ({ error } = await supabase.from('game_participants').insert([base]));
         }
         if (error) console.error("\u274c game_participants insert failed:", error.message);
-      } catch (e) { console.error("\u274c game_participants insert threw:", e.message); }
+      } catch (e) {
+        if (!e || !e.skip) console.error("\u274c game_participants insert threw:", e && e.message);
+      }
     }
 
     bumpStats(player_id, { games: 1 });
@@ -1741,7 +1778,13 @@ app.post('/api/wallet/deposit-request', async (req, res) => {
   submittedReferenceIds.add(cleanRef);
   const record = { id: Date.now(), player_id, method: method || 'Telebirr', amount: Number(amount), reference_id: cleanRef, status: 'pending', requested_at: new Date().toISOString() };
   inMemoryDeposits.push(record);
-  if (supabase) { try { await supabase.from('deposit_requests').insert([record]); } catch (e) {} }
+  if (supabase) {
+    try {
+      const { error } = await supabase.from('deposit_requests').insert([record]);
+      if (error) console.error("\u274c deposit_requests (app) insert failed:", error.message);
+    } catch (e) { console.error("\u274c deposit_requests (app) threw:", e.message); }
+  }
+  pendingDeposits.set(record.id, { ...record, created_at: record.requested_at });
   res.json({ success: true, request: record });
 });
 
@@ -1792,11 +1835,12 @@ app.post('/api/wallet/withdraw-request', async (req, res) => {
     const balances = await creditPlayerBalances(player_id, { mainAdd: -Number(amount), type: 'withdrawal', notes: `Withdraw ${amount}` });
     if (supabase) {
       try {
-        await supabase.from('withdrawal_requests').insert([{
+        const { error } = await supabase.from('withdrawal_requests').insert([{
           player_id, amount: Number(amount), method: method || 'Telebirr', account_number: account_number || '',
           account_name: account_name || '', status: 'pending', requested_at: new Date().toISOString()
         }]);
-      } catch (e) {}
+        if (error) console.error("\u274c withdrawal_requests (app) insert failed:", error.message);
+      } catch (e) { console.error("\u274c withdrawal_requests (app) threw:", e.message); }
     }
     await notifyPlayer(player_id, T.notifyWithdrawPending
       .replace('{amt}', String(amount))
@@ -1954,13 +1998,20 @@ app.post('/api/admin/deposits/:id/reject', requireAdmin, async (req, res) => {
 
 // ---------- WITHDRAWALS ----------
 app.get('/api/admin/withdrawals', requireAdmin, async (req, res) => {
-  if (!supabase) return res.json([]);
-  try {
-    const { data, error } = await supabase.from('withdrawal_requests').select('*')
-      .order('requested_at', { ascending: false }).limit(200);
-    if (error) console.error("admin withdrawals:", error.message);
-    res.json(data || []);
-  } catch (e) { res.json([]); }
+  const seen = new Map();
+  // In-memory first, so bot-side requests appear even if Supabase rejected them.
+  pendingWithdrawals.forEach(w => seen.set(String(w.id), w));
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from('withdrawal_requests').select('*')
+        .order('requested_at', { ascending: false }).limit(200);
+      if (error) console.error("admin withdrawals:", error.message);
+      (data || []).forEach(w => seen.set(String(w.id), w));
+    } catch (e) { console.error("admin withdrawals threw:", e.message); }
+  }
+  const list = Array.from(seen.values())
+    .sort((a, b) => new Date(b.requested_at || 0) - new Date(a.requested_at || 0));
+  res.json(list);
 });
 
 app.post('/api/admin/withdrawals/:id/:action', requireAdmin, async (req, res) => {
@@ -1982,6 +2033,8 @@ app.post('/api/admin/withdrawals/:id/:action', requireAdmin, async (req, res) =>
     }
     await supabase.from('withdrawal_requests')
       .update({ status: action === 'approve' ? 'approved' : 'rejected' }).eq('id', id);
+    const memW = pendingWithdrawals.get(Number(id)) || pendingWithdrawals.get(id);
+    if (memW) memW.status = action === 'approve' ? 'approved' : 'rejected';
 
     const player = await findPlayerById(w.player_id);
     if (player?.telegram_id) {
@@ -2159,15 +2212,31 @@ function resetBallPool() {
   for (let i = 1; i <= 75; i++) ballPool.push(i);
 }
 
+// Returns TRUE only when the parent row is known to exist. The caller must
+// skip the game_participants insert otherwise, or Postgres rejects it with
+// "violates foreign key constraint game_participants_game_id_fkey".
 async function ensureRoundRow(gameId) {
-  if (!supabase || !gameId) return;
-  if (roundRowsCreated.has(gameId)) return;
+  if (!supabase || !gameId) return false;
+  if (roundRowsCreated.has(gameId)) return true;
   try {
     const { error } = await supabase.from('rounds')
       .upsert([{ game_id: gameId, state: 'waiting' }], { onConflict: 'game_id' });
-    if (error) console.error("\u274c rounds upsert failed:", error.message);
-    else roundRowsCreated.add(gameId);
-  } catch (e) { console.error("\u274c rounds upsert threw:", e.message); }
+    if (!error) { roundRowsCreated.add(gameId); return true; }
+
+    console.error("\u274c rounds upsert failed:", error.message);
+    // Most likely cause: no UNIQUE constraint on rounds.game_id, so upsert
+    // can't dedupe. Fall back to a plain insert, then verify.
+    try {
+      await supabase.from('rounds').insert([{ game_id: gameId, state: 'waiting' }]);
+    } catch (e) {}
+    const { data } = await supabase.from('rounds')
+      .select('game_id').eq('game_id', gameId).maybeSingle();
+    if (data) { roundRowsCreated.add(gameId); return true; }
+    return false;
+  } catch (e) {
+    console.error("\u274c rounds upsert threw:", e.message);
+    return false;
+  }
 }
 
 function startNewRound() {

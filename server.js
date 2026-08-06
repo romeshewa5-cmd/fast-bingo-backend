@@ -438,6 +438,43 @@ async function checkWithdrawEligibility(player_id, amount, mainBalanceAfter) {
   return { ok: true, stats: st };
 }
 
+// ---- IDENTITY GUARD -------------------------------------------------
+// Every wallet endpoint must prove the caller owns the account. Accepts
+// either signed Telegram initData or the HMAC login token the bot issues.
+// Without this, knowing someone's player_id was enough to move their money.
+async function resolveCaller(req) {
+  const b = req.body || {};
+  const initData = b.initData || req.headers['x-init-data'];
+  const token = b.tgauth || req.headers['x-tgauth'];
+
+  let tid = null;
+  if (initData) {
+    const v = verifyInitData(initData);
+    if (v && v.user && v.user.id) tid = String(v.user.id);
+  }
+  if (!tid && token) tid = verifyLoginToken(token);
+  if (!tid) return null;
+
+  const player = await findPlayerByTelegramId(tid);
+  return player || null;
+}
+
+// Enforce that the caller owns `player_id`.
+async function requireOwner(req, res) {
+  const claimed = (req.body || {}).player_id;
+  const caller = await resolveCaller(req);
+  if (!caller) {
+    res.status(401).json({ success: false, error: 'auth_required' });
+    return null;
+  }
+  if (claimed && String(claimed) !== String(caller.player_id)) {
+    console.warn(`\ud83d\udea8 ownership mismatch: ${caller.player_id} tried to act as ${claimed}`);
+    res.status(403).json({ success: false, error: 'not_your_account' });
+    return null;
+  }
+  return caller;
+}
+
 function requireAdmin(req, res, next) {
   const secret = process.env.ADMIN_SECRET || '';
   const provided = req.headers['x-admin-secret'] || '';
@@ -478,7 +515,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'receipt-dedupe-2026-08-06';
+const BUILD_ID = 'withdraw-marks-2026-08-06';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {
@@ -1017,6 +1054,10 @@ app.post('/api/telegram/webhook', async (req, res) => {
       const m = text.match(/^\/(approve|reject)_(\d+)$/);
       if (m) { await handleAdminDeposit(chatId, m[1], Number(m[2])); return; }
       if (text === '/pending') { await listPending(chatId); return; }
+
+      const wm = text.match(/^\/(paid|refund)_(\d+)$/);
+      if (wm) { await handleAdminWithdrawal(chatId, wm[1], Number(wm[2])); return; }
+      if (text === '/withdrawals' || text === '/wd') { await listWithdrawals(chatId); return; }
     }
 
     // ---- ACTIVE WIZARD? ----
@@ -1208,9 +1249,14 @@ async function handleConversation(chatId, tid, text, player) {
     clearConv(tid);
     await tgSend(chatId, T.wdDone.replace('{amt}', String(amount)).replace('{phone}', phone), mainMenuKeyboard(tid));
     await notifyAdmin(
-      `🔔 <b>Withdrawal</b>\n\nUser: ${player.username}\nTG: <code>${tid}</code>\n` +
-      `Amount: <b>${amount} ETB</b>\nPhone: <code>${phone}</code>\n` +
-      `Remaining: ${balances ? balances.balance : '?'} ETB`);
+      `\u23f3 <b>WITHDRAWAL - PENDING</b>\n\n` +
+      `\ud83d\udc64 ${player.username}\n` +
+      `\ud83d\udcb0 <b>${amount} ETB</b>\n` +
+      `\ud83d\udcf1 <code>${phone}</code>\n` +
+      `\ud83d\udcb3 Remaining: ${balances ? balances.balance : '?'} ETB\n` +
+      `\ud83c\udd94 Ref: <code>${wdRec.id}</code>\n\n` +
+      `\u2705 /paid_${wdRec.id}   \u2014 mark as SENT\n` +
+      `\u274c /refund_${wdRec.id} \u2014 reject and refund`);
     return true;
   }
 
@@ -1299,6 +1345,89 @@ async function handleAdminDeposit(chatId, action, id) {
     await tgSend(rec.chat_id, T.depRejected.replace('{amt}', String(rec.amount)));
     await tgSend(chatId, `❌ Rejected #${id}.`);
   }
+}
+
+// Settle a withdrawal from Telegram. /paid_<id> marks it sent (the transfer
+// itself is manual); /refund_<id> returns the money to the player.
+async function handleAdminWithdrawal(chatId, action, id) {
+  let rec = pendingWithdrawals.get(id) || pendingWithdrawals.get(String(id));
+
+  // Fall back to Supabase if the in-memory copy was lost to a restart.
+  if (!rec && supabase) {
+    try {
+      const { data } = await supabase.from('withdrawal_requests')
+        .select('*').eq('id', id).maybeSingle();
+      if (data) rec = data;
+    } catch (e) {}
+  }
+  if (!rec) { await tgSend(chatId, `\u274c Withdrawal #${id} not found.`); return; }
+  if (rec.status && rec.status !== 'pending') {
+    await tgSend(chatId, `\u26a0\ufe0f #${id} is already <b>${rec.status}</b>.`);
+    return;
+  }
+
+  const isPaid = action === 'paid';
+  if (!isPaid) {
+    // The amount was debited when requested - give it back.
+    await creditPlayerBalances(rec.player_id, {
+      mainAdd: Number(rec.amount), type: 'withdrawal_refund',
+      notes: `Withdrawal #${id} rejected - refunded`
+    });
+  }
+
+  rec.status = isPaid ? 'approved' : 'rejected';
+  if (supabase) {
+    try {
+      await supabase.from('withdrawal_requests').update({ status: rec.status }).eq('id', id);
+    } catch (e) {}
+  }
+
+  const target = rec.chat_id || rec.telegram_id;
+  if (target) {
+    await tgSend(target, isPaid
+      ? `\u2705 <b>ወጪ ተከናውኗል!</b>\n\n\ud83d\udcb0 መጠን: <b>${rec.amount} ብር</b>\n\ud83d\udcf1 ወደ: <code>${rec.account_number || ''}</code>\n\nመልካም ጨዋታ!`
+      : `\u274c <b>የወጪ ጥያቄ ተቀባይነት አላገኘም</b>\n\n${rec.amount} ብር ወደ ሂሳብዎ ተመልሷል።`);
+  }
+
+  await tgSend(chatId, isPaid
+    ? `\u2705 <b>#${id} MARKED AS PAID</b>\n${rec.amount} ETB \u2192 <code>${rec.account_number || ''}</code>\n\n\u26a0\ufe0f Make sure you actually sent the transfer.`
+    : `\u274c <b>#${id} REFUNDED</b>\n${rec.amount} ETB returned to the player.`);
+  console.log(`\ud83d\udcb8 withdrawal #${id} -> ${rec.status}`);
+}
+
+// /withdrawals - outstanding vs already settled.
+async function listWithdrawals(chatId) {
+  const all = new Map();
+  pendingWithdrawals.forEach(w => all.set(String(w.id), w));
+  if (supabase) {
+    try {
+      const { data } = await supabase.from('withdrawal_requests').select('*')
+        .order('requested_at', { ascending: false }).limit(50);
+      (data || []).forEach(w => { if (!all.has(String(w.id))) all.set(String(w.id), w); });
+    } catch (e) {}
+  }
+  const list = Array.from(all.values());
+  const pend = list.filter(w => (w.status || 'pending') === 'pending');
+  const done = list.filter(w => w.status === 'approved').slice(0, 5);
+
+  let out = `\ud83d\udcb8 <b>WITHDRAWALS</b>\n\n`;
+  if (!pend.length) out += `\u2705 Nothing pending.\n`;
+  else {
+    out += `\u23f3 <b>PENDING (${pend.length})</b>\n`;
+    let total = 0;
+    pend.forEach(w => {
+      total += Number(w.amount) || 0;
+      out += `\n\ud83c\udd94 <code>${w.id}</code> \u2014 <b>${w.amount} ETB</b>\n` +
+             `\ud83d\udcf1 <code>${w.account_number || '-'}</code>\n` +
+             `\u2705 /paid_${w.id}  \u274c /refund_${w.id}\n`;
+    });
+    out += `\n\ud83d\udcb0 <b>Total owed: ${total} ETB</b>\n`;
+  }
+  if (done.length) {
+    out += `\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\u2705 <b>RECENTLY PAID</b>\n`;
+    done.forEach(w => { out += `<code>${w.id}</code> \u2014 ${w.amount} ETB \u2192 ${w.account_number || '-'}\n`; });
+  }
+  await tgSend(chatId, out);
 }
 
 async function listPending(chatId) {
@@ -1560,8 +1689,10 @@ app.post('/api/register', async (req, res) => {
 });
 
 app.post('/api/claim-telegram-bonus', async (req, res) => {
-  const { player_id, claimed_tg_group } = req.body;
-  if (!player_id) return res.status(400).json({ error: "Player ID required" });
+  const owner = await requireOwner(req, res);
+  if (!owner) return;
+  const { claimed_tg_group } = req.body;
+  const player_id = owner.player_id;
   try {
     const player = await findPlayerById(player_id);
     if (!player) return res.status(404).json({ error: "Player not found" });
@@ -1584,7 +1715,12 @@ app.get('/api/player/:id', async (req, res) => {
   try {
     const player = await findPlayerById(req.params.id);
     if (!player) return res.status(404).json({ error: "Player not found" });
-    res.json(sanitizePlayer(player));
+    // Masked: this endpoint has no auth, so it must not reveal a full phone.
+    const sp = sanitizePlayer(player);
+    const ph = String(sp.phone_number || '');
+    sp.phone_number = ph.length > 4 ? ph.slice(0, -4).replace(/\d/g, '*') + ph.slice(-4) : ph;
+    delete sp.telegram_id;
+    res.json(sp);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1619,7 +1755,10 @@ app.get('/api/games/taken-cards/:game_id', async (req, res) => {
 });
 
 app.post('/api/games/create', async (req, res) => {
-  const { player_id, game_id, cards_bought, cards_list } = req.body;
+  const owner = await requireOwner(req, res);
+  if (!owner) return;
+  const { game_id, cards_bought, cards_list } = req.body;
+  const player_id = owner.player_id;
   console.log("🎮 Game create:", player_id, game_id, cards_bought);
 
   if (!player_id || !game_id || !cards_bought) {
@@ -1816,7 +1955,8 @@ app.get('/api/leaderboard', async (req, res) => {
     } catch (e) {}
 
     const list = ids.map(id => ({
-      player_id: id,
+      // player_id deliberately NOT exposed - it is the credential every
+      // /api/wallet/* endpoint trusts.
       username: names[id] || inMemoryPlayers.get(id)?.username || 'Player',
       wins: tally[id].wins,
       won: tally[id].won
@@ -1830,7 +1970,10 @@ app.get('/api/leaderboard', async (req, res) => {
 });
 
 app.post('/api/wallet/deposit-request', async (req, res) => {
-  const { player_id, method, amount, reference_id } = req.body;
+  const owner = await requireOwner(req, res);
+  if (!owner) return;
+  const { method, amount, reference_id } = req.body;
+  const player_id = owner.player_id;
   if (!player_id || !amount || !reference_id) return res.status(400).json({ success: false, error: "Missing fields" });
   const cleanRef = String(reference_id).toUpperCase();
   if (submittedReferenceIds.has(cleanRef)) return res.status(400).json({ success: false, error: "duplicate_reference" });
@@ -1848,7 +1991,10 @@ app.post('/api/wallet/deposit-request', async (req, res) => {
 });
 
 app.post('/api/wallet/redeem-coupon', async (req, res) => {
-  const { player_id, coupon_code } = req.body;
+  const owner = await requireOwner(req, res);
+  if (!owner) return;
+  const { coupon_code } = req.body;
+  const player_id = owner.player_id;
   if (!player_id || !coupon_code) return res.status(400).json({ success: false, error: "Missing fields" });
   const code = String(coupon_code).toUpperCase();
   const key = `${player_id}:${code}`;
@@ -1866,7 +2012,10 @@ app.post('/api/wallet/redeem-coupon', async (req, res) => {
 });
 
 app.post('/api/wallet/withdraw-request', async (req, res) => {
-  const { player_id, method, account_number, account_name, amount } = req.body;
+  const owner = await requireOwner(req, res);
+  if (!owner) return;                       // 401/403 already sent
+  const { method, account_number, account_name, amount } = req.body;
+  const player_id = owner.player_id;        // never trust the body
   if (!player_id || !amount || Number(amount) < MIN_WITHDRAWAL_AMOUNT) {
     return res.status(400).json({ success: false, error: `Min ${MIN_WITHDRAWAL_AMOUNT} ETB` });
   }
@@ -1905,7 +2054,24 @@ app.post('/api/wallet/withdraw-request', async (req, res) => {
       .replace('{amt}', String(amount))
       .replace('{acct}', account_number || '-')
       .replace('{bal}', String(balances ? balances.balance : '?')));
-    await notifyAdmin(`\ud83d\udd14 <b>New Withdrawal (app)</b>\nPlayer: <code>${player_id}</code>\nAmount: <b>${amount} ETB</b>\nTo: <code>${account_number || '-'}</code>`);
+    const appWd = {
+      id: ++withdrawalSeq, player_id, amount: Number(amount),
+      method: method || 'Telebirr', account_number: account_number || '',
+      account_name: account_name || player.username || '',
+      status: 'pending', requested_at: new Date().toISOString(),
+      telegram_id: player.telegram_id ? String(player.telegram_id) : null,
+      chat_id: player.telegram_id ? String(player.telegram_id) : null
+    };
+    pendingWithdrawals.set(appWd.id, appWd);
+    await notifyAdmin(
+      `\u23f3 <b>WITHDRAWAL - PENDING</b>\n\n` +
+      `\ud83d\udc64 ${player.username || player_id}\n` +
+      `\ud83d\udcb0 <b>${amount} ETB</b>\n` +
+      `\ud83d\udcf1 <code>${account_number || '-'}</code>\n` +
+      `\ud83d\udcb3 Remaining: ${balances ? balances.balance : '?'} ETB\n` +
+      `\ud83c\udd94 Ref: <code>${appWd.id}</code>\n\n` +
+      `\u2705 /paid_${appWd.id}   \u2014 mark as SENT\n` +
+      `\u274c /refund_${appWd.id} \u2014 reject &amp; refund`);
 
     res.json({ success: true, balances });
   } catch (err) {

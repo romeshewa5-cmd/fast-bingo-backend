@@ -115,7 +115,7 @@ const WINNER_DISPLAY_SECONDS = Number(process.env.WINNER_DISPLAY_SECONDS) || 5;
 // completes. 1 = must claim while the completing ball is still showing.
 const BINGO_GRACE_BALLS = Number(process.env.BINGO_GRACE_BALLS) || 1;
 const MIN_WITHDRAWAL_AMOUNT = Number(process.env.MIN_WITHDRAWAL_AMOUNT) || 100;
-const SIGNUP_BONUS = 10;
+const SIGNUP_BONUS = Number(process.env.SIGNUP_BONUS ?? 5);
 const REFERRAL_BONUS = Number(process.env.REFERRAL_BONUS) || 5;
 const MAX_CARDS_PER_PLAYER = Number(process.env.MAX_CARDS_PER_PLAYER) || 2;
 // House cartelas: keep early rounds alive so a lone player isn't stuck in an
@@ -124,7 +124,9 @@ const HOUSE_ENABLED = String(process.env.HOUSE_ENABLED || 'true') === 'true';
 const HOUSE_NAMES = (process.env.HOUSE_NAMES || 'Abel,Samson,Tebarek')
   .split(',').map(x => x.trim()).filter(Boolean);
 const HOUSE_MIN_REAL_PLAYERS = Number(process.env.HOUSE_MIN_REAL_PLAYERS) || 4;
-const TG_GROUP_BONUS = 10;
+const TG_GROUP_BONUS = Number(process.env.TG_GROUP_BONUS ?? 5);
+// Advertised total, always derived - never hardcode it in copy again.
+const TOTAL_WELCOME_BONUS = SIGNUP_BONUS + TG_GROUP_BONUS;
 
 // ============ LOCAL PERSISTENCE (survives restarts) ============
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -132,6 +134,7 @@ const PLAYERS_FILE = path.join(DATA_DIR, 'players.json');
 const TOKENS_FILE = path.join(DATA_DIR, 'tokens.json');
 const STATS_FILE = path.join(DATA_DIR, 'stats.json');
 const RECEIPTS_FILE = path.join(DATA_DIR, 'receipts.json');
+const COUPONS_FILE = path.join(DATA_DIR, 'coupons.json');
 const PHONES_FILE = path.join(DATA_DIR, 'phones.json');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 
@@ -139,6 +142,11 @@ const statsCache = new Map();    // player_id -> { deposited, games, deposits }
 // receipt ref -> { player_id, status, at }. Must be declared before loadDisk()
 // runs, or the restore silently throws on the temporal dead zone.
 const usedReceipts = new Map();
+// NO default coupons. 'BINGO20' and 'FREEPLAY' used to be seeded here and were
+// redeemable by anyone who guessed them - free money the operator never issued.
+// Declared before loadDisk() or the restore hits the temporal dead zone.
+const inMemoryCoupons = [];
+const couponRedemptions = new Set();
 const loginTokens = new Map();   // token -> { tid, created }
 const tidToToken = new Map();    // tid   -> token
 const inMemoryPlayers = new Map();        // player_id -> player
@@ -172,6 +180,15 @@ function loadDisk() {
     Object.entries(raw || {}).forEach(([k, v]) => statsCache.set(k, v));
   } catch (e) {}
   try {
+    const raw = JSON.parse(fs.readFileSync(COUPONS_FILE, 'utf8'));
+    if (raw && Array.isArray(raw.coupons)) {
+      inMemoryCoupons.length = 0;
+      raw.coupons.forEach(c => inMemoryCoupons.push(c));
+    }
+    (raw && raw.redemptions || []).forEach(k => couponRedemptions.add(k));
+    if (inMemoryCoupons.length) console.log(`\ud83c\udf9f\ufe0f Loaded ${inMemoryCoupons.length} coupons, ${couponRedemptions.size} redemptions`);
+  } catch (e) {}
+  try {
     const raw = JSON.parse(fs.readFileSync(RECEIPTS_FILE, 'utf8'));
     Object.entries(raw || {}).forEach(([k, v]) => usedReceipts.set(k, v));
     console.log(`\ud83e\uddfe Loaded ${usedReceipts.size} used receipt refs`);
@@ -198,16 +215,17 @@ function flushDisk() {
     } catch (e) {}
     try { fs.writeFileSync(STATS_FILE, JSON.stringify(Object.fromEntries(statsCache))); } catch (e) {}
     try { fs.writeFileSync(RECEIPTS_FILE, JSON.stringify(Object.fromEntries(usedReceipts))); } catch (e) {}
+    try {
+      fs.writeFileSync(COUPONS_FILE, JSON.stringify({
+        coupons: inMemoryCoupons,
+        redemptions: Array.from(couponRedemptions)
+      }));
+    } catch (e) {}
   }, 400);
 }
 loadDisk();
 
 const inMemoryDeposits = [];
-const inMemoryCoupons = [
-  { code: 'BINGO20', bonus_amount: 20, max_uses: 1000, used_count: 0, is_active: true },
-  { code: 'FREEPLAY', bonus_amount: 10, max_uses: 500, used_count: 0, is_active: true },
-];
-const couponRedemptions = new Set();
 const submittedReferenceIds = new Set();
 
 // Round participants kept in memory so the game works WITHOUT supabase.
@@ -279,15 +297,22 @@ function verifyInitData(initData) {
 // and collect the signup bonus each time.
 function normalizePhone(raw) {
   if (!raw) return null;
-  let d = String(raw).replace(/[^\d]/g, '');   // digits only
-  if (!d) return null;
-  if (d.startsWith('00')) d = d.slice(2);       // 00251... -> 251...
-  if (d.startsWith('251')) d = d.slice(3);      // country code off
-  else if (d.startsWith('0')) d = d.slice(1);   // national trunk 0 off
-  // Ethiopian mobile numbers are 9 digits starting with 9 or 7.
-  if (d.length > 9) d = d.slice(-9);
-  if (d.length !== 9) return '+' + String(raw).replace(/[^\d]/g, '');  // unknown shape - keep as-is
-  return '+251' + d;
+  const all = String(raw).replace(/[^\d]/g, '');   // digits only
+  if (!all) return null;
+
+  let d = all;
+  if (d.startsWith('00')) d = d.slice(2);          // 00251... -> 251...
+  if (d.startsWith('251')) d = d.slice(3);         // country code off
+  else if (d.startsWith('0')) d = d.slice(1);      // national trunk 0 off
+
+  // Ethiopian mobiles are exactly 9 digits starting 9 or 7. Only collapse to
+  // the +251 form when it really looks Ethiopian - otherwise a foreign number
+  // could be rewritten into a fake local one and merged with someone else.
+  if (d.length === 9 && /^[97]/.test(d)) return '+251' + d;
+
+  // Anything else: keep the full digits verbatim so distinct numbers stay
+  // distinct (still stable, since it is derived only from the digits).
+  return '+' + all;
 }
 
 function sanitizePlayer(p) {
@@ -575,13 +600,16 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'phone-dedupe-2026-08-06';
+const BUILD_ID = 'bonus-5etb-2026-08-06';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {
   res.json({
     bot_username: BOT_USERNAME_ENV || null,
     referral_bonus: REFERRAL_BONUS,
+    signup_bonus: SIGNUP_BONUS,
+    group_bonus: TG_GROUP_BONUS,
+    total_welcome_bonus: TOTAL_WELCOME_BONUS,
     card_price: CARD_PRICE,
     house_fee: HOUSE_FEE_PER_CARD,
     min_withdrawal: MIN_WITHDRAWAL_AMOUNT,
@@ -830,20 +858,20 @@ const T = {
   welcome:
     "🎉 እንኳን ወደ ፋስት ቢንጎ በደህና መጡ!\n\n" +
     "መለያዎን ለማረጋገጥ የስልክ ቁጥርዎን ያካፍሉ።\n" +
-    "ወዲያውኑ 10 ብር የምዝገባ ቦነስ ያገኛሉ!",
+    `ወዲያውኑ ${SIGNUP_BONUS} ብር የምዝገባ ቦነስ ያገኛሉ!`,
   askPhone: "📱 የስልክ ቁጥሬን አጋራለሁ",
   intro:
     "🎉 እንኳን ወደ ፋስት ቢንጎ በደህና መጡ!\n" +
     "(Welcome to Fast Bingo!)\n\n" +
     "🎮 ይጫወቱ እና ትልቅ ገንዘብ ያሸንፉ!\n\n" +
-    "🎁 <b>ሲመዘገቡ 20 ብር ቦነስ</b>\n" +
-    "   • 10 ብር የምዝገባ ቦነስ\n" +
-    "   • 10 ብር የግሩፕ ቦነስ\n\n" +
+    `🎁 <b>ሲመዘገቡ ${TOTAL_WELCOME_BONUS} ብር ቦነስ</b>\n` +
+    `   • ${SIGNUP_BONUS} ብር የምዝገባ ቦነስ\n` +
+    `   • ${TG_GROUP_BONUS} ብር የግሩፕ ቦነስ\n\n` +
     "🤝 <b>ጓደኛ ሲጋብዙ 5 ብር</b> ለእያንዳንዱ ጓደኛ!\n\n" +
     "ለመጀመር የስልክ ቁጥርዎን ያጋሩ 👇",
-  phoneOk: "✅ ስልክ ቁጥርዎ ተረጋግጧል!\n🎁 10 ብር የምዝገባ ቦነስ ተከፍሎታል።",
+  phoneOk: `✅ ስልክ ቁጥርዎ ተረጋግጧል!\n🎁 ${SIGNUP_BONUS} ብር የምዝገባ ቦነስ ተከፍሎታል።`,
   groupOffer:
-    "🎁 ተጨማሪ 10 ብር ቦነስ ይፈልጋሉ?\n\n" +
+    `🎁 ተጨማሪ ${TG_GROUP_BONUS} ብር ቦነስ ይፈልጋሉ?\n\n` +
     "የቦነስ ህግ:\n" +
     "1️⃣ የቴሌግራም ግሩፓችንን ይቀላቀሉ\n" +
     "2️⃣ ከዚያ «ቦነስ አረጋግጥ» የሚለውን ይጫኑ\n" +
@@ -1611,9 +1639,9 @@ async function handleCallback(cb) {
 const PROMO_MESSAGES = [
   // 1 — welcome / signup bonus
   () => `🎉 <b>እንኳን ወደ ፋስት ቢንጎ በደህና መጡ!</b> 🎉\n\n` +
-    `🎁 <b>ለአዲስ ተጫዋቾች 20 ብር ቦነስ!</b>\n` +
-    `• 10 ብር የምዝገባ ቦነስ\n` +
-    `• 10 ብር የግሩፕ ቦነስ\n\n` +
+    `🎁 <b>ለአዲስ ተጫዋቾች ${TOTAL_WELCOME_BONUS} ብር ቦነስ!</b>\n` +
+    `• ${SIGNUP_BONUS} ብር የምዝገባ ቦነስ\n` +
+    `• ${TG_GROUP_BONUS} ብር የግሩፕ ቦነስ\n\n` +
     `🤝 <b>ጓደኞችዎን ይጋብዙ እና ያትርፉ!</b>\n` +
     `ለእያንዳንዱ ጓደኛ ${REFERRAL_BONUS} ብር\n\n` +
     `🎮 የካርቴላ ዋጋ: <b>${CARD_PRICE} ብር</b>\n` +
@@ -1644,7 +1672,7 @@ const PROMO_MESSAGES = [
     `🔢 በአንድ ዙር እስከ 2 ካርቴላ\n` +
     `💸 ፈጣን ክፍያ — በቴሌብር እና በሲቢኢ\n` +
     `📱 ከቴሌግራም ሳይወጡ ይጫወቱ\n\n` +
-    `🎁 አዲስ ተጫዋች ከሆኑ <b>20 ብር ቦነስ</b> ይጠብቅዎታል!\n\n` +
+    `🎁 አዲስ ተጫዋች ከሆኑ <b>${TOTAL_WELCOME_BONUS} ብር ቦነስ</b> ይጠብቅዎታል!\n\n` +
     `👇 አሁኑኑ ይመዝገቡ!`,
 
   // 5 — winners hype
@@ -1789,7 +1817,20 @@ app.post('/api/claim-telegram-bonus', async (req, res) => {
     if (!player) return res.status(404).json({ error: "Player not found" });
     if (player.tg_bonus_claimed) return res.json({ success: true, claimed: true, user: sanitizePlayer(player) });
 
-    const bonusAmount = claimed_tg_group === true ? TG_GROUP_BONUS : 0;
+    // VERIFY membership server-side. This endpoint used to pay 10 ETB purely
+    // because the client said {claimed_tg_group:true} - free money for anyone
+    // who called it directly. The bot callback always checked; this did not.
+    let bonusAmount = 0;
+    if (claimed_tg_group === true) {
+      if (TG_GROUP_ID && player.telegram_id) {
+        const member = await isGroupMember(player.telegram_id);
+        if (member !== true) {
+          console.warn(`\u26d4 group bonus refused (not a member): ${player_id}`);
+          return res.status(400).json({ success: false, error: 'not_in_group' });
+        }
+      }
+      bonusAmount = TG_GROUP_BONUS;
+    }
     const balances = await creditPlayerBalances(player_id, {
       playAdd: bonusAmount,
       type: claimed_tg_group ? 'telegram_group_bonus' : 'signup_complete',
@@ -2092,10 +2133,23 @@ app.post('/api/wallet/redeem-coupon', async (req, res) => {
   if (couponRedemptions.has(key)) return res.status(400).json({ success: false, error: "Already redeemed" });
   const coupon = inMemoryCoupons.find(c => c.code === code && c.is_active);
   if (!coupon) return res.status(404).json({ success: false, error: "Invalid coupon" });
+
+  // max_uses was incremented but never checked - a coupon could be redeemed
+  // far beyond its limit.
+  if (Number(coupon.max_uses) > 0 && Number(coupon.used_count) >= Number(coupon.max_uses)) {
+    console.warn(`\u26d4 coupon ${code} exhausted (${coupon.used_count}/${coupon.max_uses})`);
+    return res.status(400).json({ success: false, error: "coupon_exhausted" });
+  }
+  if (coupon.expires_at && new Date(coupon.expires_at) < new Date()) {
+    return res.status(400).json({ success: false, error: "coupon_expired" });
+  }
+
   const balances = await creditPlayerBalances(player_id, { playAdd: coupon.bonus_amount, type: 'coupon', notes: `Coupon ${code}` });
   if (!balances) return res.status(404).json({ success: false, error: "Player not found" });
   couponRedemptions.add(key);
   coupon.used_count++;
+  flushDisk();
+  console.log(`\ud83c\udf9f\ufe0f coupon ${code} redeemed by ${player_id} (+${coupon.bonus_amount}) ${coupon.used_count}/${coupon.max_uses}`);
   await notifyPlayer(player_id, T.notifyCoupon
     .replace('{amt}', String(coupon.bonus_amount))
     .replace('{bal}', String(balances ? balances.balance : '?')));
@@ -2393,11 +2447,22 @@ app.post('/api/admin/coupons/create', requireAdmin, (req, res) => {
     max_uses: Number(max_uses) || 100, used_count: 0, is_active: true
   };
   inMemoryCoupons.push(coupon);
-  console.log("\ud83c\udf9f\ufe0f coupon created:", upper, bonus_amount, "ETB");
+  flushDisk();
+  console.log("\ud83c\udf9f\ufe0f coupon created:", upper, bonus_amount, "ETB, max", coupon.max_uses);
   res.json({ success: true, coupon });
 });
 
 // ---------- TRANSACTIONS ----------
+app.post('/api/admin/coupons/disable', requireAdmin, (req, res) => {
+  const code = String((req.body || {}).code || '').toUpperCase().trim();
+  const c = inMemoryCoupons.find(x => x.code === code);
+  if (!c) return res.status(404).json({ error: 'Coupon not found' });
+  c.is_active = false;
+  flushDisk();
+  console.log("\ud83d\udeab coupon disabled:", code);
+  res.json({ success: true, coupon: c });
+});
+
 app.get('/api/admin/transactions', requireAdmin, async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 100, 500);
   if (!supabase) return res.json([]);
@@ -2779,6 +2844,18 @@ io.on('connection', (socket) => {
 
   socket.on('request_tick', () => socket.emit('room_tick', tickPayload()));
 
+  // Identify this socket once, so claim_bingo can't be spoofed for someone else.
+  socket.data = socket.data || {};
+  socket.on('identify', async (d) => {
+    try {
+      const tid = (d && d.initData && (verifyInitData(d.initData) || {}).user?.id)
+        || (d && d.tgauth && verifyLoginToken(d.tgauth));
+      if (!tid) return;
+      const p = await findPlayerByTelegramId(String(tid));
+      if (p) { socket.data.player_id = p.player_id; }
+    } catch (e) {}
+  });
+
   socket.on('sync_player_profile', async (data) => {
     if (data?.player_id) {
       const existing = await findPlayerById(data.player_id);
@@ -2794,6 +2871,11 @@ io.on('connection', (socket) => {
     };
     if (globalGameState !== "playing") return reject('round_not_playing');
     if (!player_id || !cardNum) return reject('missing_fields');
+    // If this socket identified itself, it may only claim for ITSELF.
+    if (socket.data && socket.data.player_id && String(socket.data.player_id) !== String(player_id)) {
+      console.warn(`\ud83d\udea8 bingo claim spoof: ${socket.data.player_id} tried to claim for ${player_id}`);
+      return reject('not_your_account');
+    }
     if (currentRoundWinners.some(w => w.player_id === player_id)) return;
 
     const part = participantsOf(currentActiveGameRoundId).get(player_id);
@@ -2863,6 +2945,7 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`✈️ TG_GROUP_LINK: ${TG_GROUP_LINK || 'NOT SET'}`);
   console.log(`👤 ADMIN_ID: ${ADMIN_ID || 'NOT SET - /promo and /approve will not work'}`);
   console.log(`🖼️ PROMO_IMAGE_URL: ${PROMO_IMAGE_URL || '(none - text-only posts)'}`);
+  console.log(`🎁 Signup ${SIGNUP_BONUS} + Group ${TG_GROUP_BONUS} = ${TOTAL_WELCOME_BONUS} ETB welcome | Referral ${REFERRAL_BONUS} ETB`);
   console.log(`🎁 First deposit bonus: ${Math.round(FIRST_DEPOSIT_BONUS_PCT*100)}% up to ${FIRST_DEPOSIT_BONUS_CAP} ETB | repeat: ${Math.round(DEPOSIT_BONUS_PCT*100)}%`);
   console.log(`🔐 Locked reserve: ${MIN_WALLET_RESERVE} ETB must always remain in the main wallet`);
   console.log(`🔒 Withdraw gates: deposit >=${MIN_DEPOSIT_BEFORE_WITHDRAW} ETB` +

@@ -86,8 +86,10 @@ const MIN_DEPOSIT_AMOUNT = Number(process.env.MIN_DEPOSIT_AMOUNT) || 50;
 // Guard against a bad env value. Number('abc') is NaN, and NaN silently
 // poisons the bonus maths (Math.floor(amount * NaN) = NaN). Also accept "100"
 // meaning 100% rather than a 100x multiplier.
+// DEFAULT IS 0 - deposit bonuses are opt-in. Previously this defaulted to 1.0
+// (100%), so deleting the env var would silently re-enable a full match.
 let _fdb = Number(process.env.FIRST_DEPOSIT_BONUS_PCT);
-if (!Number.isFinite(_fdb) || _fdb < 0) _fdb = 1.0;
+if (!Number.isFinite(_fdb) || _fdb < 0) _fdb = 0;
 if (_fdb > 5) _fdb = _fdb / 100;          // someone typed 100 instead of 1.0
 const FIRST_DEPOSIT_BONUS_PCT = _fdb;
 const FIRST_DEPOSIT_BONUS_CAP = Number(process.env.FIRST_DEPOSIT_BONUS_CAP) || 200;
@@ -600,7 +602,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'house-earnings-2026-08-07';
+const BUILD_ID = 'no-deposit-bonus-2026-08-07';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {
@@ -2322,7 +2324,12 @@ app.get('/api/admin/deposits', requireAdmin, async (req, res) => {
   res.json(list);
 });
 
-const DEPOSIT_BONUS_PCT = Number(process.env.DEPOSIT_BONUS_PCT ?? 0.10);
+// Also opt-in now. Was 10% by default, which quietly cost money on every
+// approved deposit while the business is cash-negative.
+let _rdb = Number(process.env.DEPOSIT_BONUS_PCT);
+if (!Number.isFinite(_rdb) || _rdb < 0) _rdb = 0;
+if (_rdb > 5) _rdb = _rdb / 100;
+const DEPOSIT_BONUS_PCT = _rdb;
 
 app.post('/api/admin/deposits/:id/approve', requireAdmin, async (req, res) => {
   const id = req.params.id;
@@ -2992,7 +2999,12 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`👤 ADMIN_ID: ${ADMIN_ID || 'NOT SET - /promo and /approve will not work'}`);
   console.log(`🖼️ PROMO_IMAGE_URL: ${PROMO_IMAGE_URL || '(none - text-only posts)'}`);
   console.log(`🎁 Signup ${SIGNUP_BONUS} + Group ${TG_GROUP_BONUS} = ${TOTAL_WELCOME_BONUS} ETB welcome | Referral ${REFERRAL_BONUS} ETB`);
-  console.log(`🎁 First deposit bonus: ${Math.round(FIRST_DEPOSIT_BONUS_PCT*100)}% up to ${FIRST_DEPOSIT_BONUS_CAP} ETB | repeat: ${Math.round(DEPOSIT_BONUS_PCT*100)}%`);
+  if (FIRST_DEPOSIT_BONUS_PCT === 0 && DEPOSIT_BONUS_PCT === 0) {
+    console.log(`🎁 Deposit bonuses: OFF (players get exactly what they deposit)`);
+  } else {
+    console.log(`🎁 First deposit bonus: ${Math.round(FIRST_DEPOSIT_BONUS_PCT*100)}% up to ${FIRST_DEPOSIT_BONUS_CAP} ETB | repeat: ${Math.round(DEPOSIT_BONUS_PCT*100)}%`);
+    console.log(`   ⚠️  You are cash-negative - consider FIRST_DEPOSIT_BONUS_PCT=0`);
+  }
   console.log(`🔐 Locked reserve: ${MIN_WALLET_RESERVE} ETB must always remain in the main wallet`);
   console.log(`🔒 Withdraw gates: deposit >=${MIN_DEPOSIT_BEFORE_WITHDRAW} ETB` +
     (WITHDRAW_REQUIRE_GAMES ? ` AND >=${MIN_GAMES_BEFORE_WITHDRAW} games`

@@ -600,7 +600,7 @@ app.get('/api/debug/webhook', async (req, res) => {
 });
 
 // Bump this whenever server.js changes, so /api/health proves which build is live.
-const BUILD_ID = 'bonus-5etb-2026-08-06';
+const BUILD_ID = 'house-earnings-2026-08-07';
 
 // Public config so the webapp can build a correct referral link.
 app.get('/api/config', (req, res) => {
@@ -2237,7 +2237,12 @@ app.get('/api/admin/overview', requireAdmin, (req, res) => {
   const parts = participantsOf(currentActiveGameRoundId);
   const totalCards = Array.from(parts.values())
     .reduce((n, p) => n + (Number(p.purchased_cards) || 0), 0);
+  const realCards = Array.from(parts.values())
+    .filter(p => !p.is_house)
+    .reduce((n, p) => n + (Number(p.purchased_cards) || 0), 0);
   const pot = totalCards * (CARD_PRICE - HOUSE_FEE_PER_CARD);
+  const collected = realCards * CARD_PRICE;          // real cash taken in
+  const houseCut = collected - pot;                  // what you keep this round
   res.json({
     state: globalGameState,
     game_id: currentActiveGameRoundId,
@@ -2246,8 +2251,14 @@ app.get('/api/admin/overview', requireAdmin, (req, res) => {
     participantCount: parts.size,
     minPlayersToStart: MIN_PLAYERS_TO_START,
     totalCards,
+    realCards,
     pot,
     potentialPayout: pot,
+    // Live economics for this round.
+    collected,
+    houseCut,
+    houseFeePerCard: HOUSE_FEE_PER_CARD,
+    cardPrice: CARD_PRICE,
     players: inMemoryPlayers.size
   });
 });
@@ -2461,6 +2472,41 @@ app.post('/api/admin/coupons/disable', requireAdmin, (req, res) => {
   flushDisk();
   console.log("\ud83d\udeab coupon disabled:", code);
   res.json({ success: true, coupon: c });
+});
+
+// House earnings: collected from entry fees minus paid out as winnings.
+app.get('/api/admin/earnings', requireAdmin, async (req, res) => {
+  if (!supabase) return res.json({ error: 'supabase required' });
+  const since = (days) => new Date(Date.now() - days * 86400000).toISOString();
+
+  async function bucket(fromIso) {
+    let q = supabase.from('transactions').select('type, amount').limit(50000);
+    if (fromIso) q = q.gte('created_at', fromIso);
+    const { data, error } = await q;
+    if (error) { console.error('earnings:', error.message); return null; }
+    let collected = 0, paid = 0, deposits = 0, withdrawals = 0, games = 0;
+    (data || []).forEach(t => {
+      const a = Number(t.amount) || 0;
+      if (t.type === 'entry_fee') { collected += -a; games++; }
+      else if (t.type === 'payout') paid += a;
+      else if (t.type === 'deposit') deposits += a;
+      else if (t.type === 'withdrawal') withdrawals += -a;
+    });
+    const houseCut = collected - paid;
+    return {
+      games, cards: Math.round(collected / (CARD_PRICE || 10)),
+      collected, paid_out: paid, house_cut: houseCut,
+      payout_ratio: collected ? Number((paid / collected).toFixed(3)) : 0,
+      deposits, withdrawals, net_cash: deposits - withdrawals
+    };
+  }
+
+  const [today, week, all] = await Promise.all([
+    bucket(new Date(new Date().setHours(0, 0, 0, 0)).toISOString()),
+    bucket(since(7)),
+    bucket(null)
+  ]);
+  res.json({ today, last7days: week, allTime: all });
 });
 
 app.get('/api/admin/transactions', requireAdmin, async (req, res) => {
